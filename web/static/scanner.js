@@ -419,8 +419,8 @@
     // If anchors are too dark (< 150 avg brightness), don't trust WB —
     // we're likely sampling the wrong blobs or the image is underexposed.
     // Also clamp gains to 1.5 max to avoid amplifying camera noise.
-    var MAX_GAIN = 1.5;
-    var MIN_ANCHOR_BRIGHTNESS = 150;
+    var MAX_GAIN = 2.0;
+    var MIN_ANCHOR_BRIGHTNESS = 100;
     var avgBright = (avgR + avgG + avgB) / 3;
 
     var gr = 1, gg = 1, gb = 1;
@@ -792,6 +792,7 @@
     // header, lock it in.  Re-derive only if anchors appear to have moved.
     this._cachedTransform = null;  // last known-good transform
     this._goodFrameCount = 0;     // consecutive good frames with this transform
+    this._badHeaderStreak = 0;    // consecutive bad headers (for stale eviction)
 
     // Debug state (always collected; drawn when debug=true in URL)
     this._debug = /[?&]debug/.test(window.location.search);
@@ -1037,6 +1038,7 @@
       var result = this._decoder.addFrame(dotValues);
       this._dbgStatus = "decoded";
       this._goodFrameCount++;
+      this._badHeaderStreak = 0; // reset streak on good header
 
       if (this._onProgress) {
         this._onProgress(result.progress);
@@ -1050,6 +1052,20 @@
       }
     } else {
       this._dbgStatus = "bad-header";
+
+      // Stale transform eviction: if we get 30+ consecutive bad headers
+      // with a locked transform, it's clearly wrong — clear it and let
+      // the scanner re-derive from scratch.
+      if (this._cachedTransform) {
+        this._badHeaderStreak++;
+        if (this._badHeaderStreak >= 30) {
+          this._cachedTransform = null;
+          this._goodFrameCount = 0;
+          this._badHeaderStreak = 0;
+          this._decoder.reset();
+          this._dbgStatus = "evicted";
+        }
+      }
     }
   };
 
@@ -1145,7 +1161,8 @@
 
     var debugLines = [
       "status: " + this._dbgStatus +
-        (this._cachedTransform ? " [locked]" : ""),
+        (this._cachedTransform ? " [locked]" : "") +
+        (this._badHeaderStreak > 0 ? " bad:" + this._badHeaderStreak : ""),
       "blobs: " + this._dbgBlobCount +
         " good:" + this._goodFrameCount,
     ];
