@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>dotbeam</title>
+    <style>
+        *, *::before, *::after {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #0a0a1a;
+            color: #ffffff;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        .container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 24px;
+            padding: 24px;
+            width: 100%;
+            max-width: 648px;
+        }
+
+        .header {
+            font-size: 14px;
+            font-weight: 300;
+            letter-spacing: 0.12em;
+            text-transform: lowercase;
+            color: rgba(255, 255, 255, 0.25);
+            user-select: none;
+        }
+
+        .canvas-wrapper {
+            width: 100%;
+            aspect-ratio: 1 / 1;
+            max-width: 600px;
+            max-height: 600px;
+            border-radius: 16px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        #transmit-canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        .info {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+            text-align: center;
+        }
+
+        .transmitting {
+            font-size: 13px;
+            font-weight: 400;
+            color: rgba(255, 255, 255, 0.38);
+            max-width: 400px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .transmitting span {
+            color: rgba(255, 255, 255, 0.6);
+        }
+
+        .hint {
+            font-size: 12px;
+            font-weight: 300;
+            color: rgba(255, 255, 255, 0.19);
+        }
+
+        .error-message {
+            font-size: 14px;
+            font-weight: 400;
+            color: rgba(255, 100, 100, 0.7);
+            text-align: center;
+            padding: 40px 24px;
+        }
+
+        @media (max-height: 700px) {
+            .container {
+                gap: 16px;
+                padding: 16px;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .container {
+                padding: 16px;
+                gap: 20px;
+            }
+
+            .canvas-wrapper {
+                border-radius: 12px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">dotbeam</div>
+
+        <div class="canvas-wrapper">
+            <canvas id="transmit-canvas"></canvas>
+        </div>
+
+        <div class="info">
+            <div class="transmitting" id="transmitting-label"></div>
+            <div class="hint" id="hint-label">Point your camera at this screen to receive</div>
+        </div>
+    </div>
+
+    <script src="/static/dotbeam-core.js"></script>
+    <script src="/static/renderer.js"></script>
+    <script>
+        (function () {
+            var canvas = document.getElementById("transmit-canvas");
+            var transmittingLabel = document.getElementById("transmitting-label");
+            var hintLabel = document.getElementById("hint-label");
+            var renderer = null;
+
+            function resizeCanvas() {
+                var wrapper = canvas.parentElement;
+                var rect = wrapper.getBoundingClientRect();
+                var size = Math.floor(Math.min(rect.width, rect.height));
+                canvas.width = size * (window.devicePixelRatio || 1);
+                canvas.height = size * (window.devicePixelRatio || 1);
+                canvas.style.width = size + "px";
+                canvas.style.height = size + "px";
+            }
+
+            function truncate(text, maxLen) {
+                if (!text) return "";
+                if (text.length <= maxLen) return text;
+                return text.substring(0, maxLen) + "\u2026";
+            }
+
+            function showError(message) {
+                transmittingLabel.textContent = "";
+                hintLabel.textContent = "";
+
+                var errorEl = document.createElement("div");
+                errorEl.className = "error-message";
+                errorEl.textContent = message;
+
+                var wrapper = canvas.parentElement;
+                wrapper.style.display = "flex";
+                wrapper.style.alignItems = "center";
+                wrapper.style.justifyContent = "center";
+                canvas.style.display = "none";
+                wrapper.appendChild(errorEl);
+            }
+
+            function init() {
+                resizeCanvas();
+                window.addEventListener("resize", resizeCanvas);
+
+                fetch("/api/frames")
+                    .then(function (response) {
+                        if (!response.ok) {
+                            throw new Error("Server returned " + response.status);
+                        }
+                        return response.json();
+                    })
+                    .then(function (data) {
+                        var displayText = data.text || data.data || "";
+                        transmittingLabel.innerHTML =
+                            "Transmitting: <span>" + truncate(displayText, 60) + "</span>";
+
+                        renderer = new DotbeamRenderer(canvas);
+                        renderer.load(data);
+                        renderer.start();
+                    })
+                    .catch(function (err) {
+                        console.error("Failed to load frames:", err);
+                        showError("Unable to load transmission data. Please try again.");
+                    });
+            }
+
+            if (document.readyState === "loading") {
+                document.addEventListener("DOMContentLoaded", init);
+            } else {
+                init();
+            }
+        })();
+    </script>
+</body>
+</html>

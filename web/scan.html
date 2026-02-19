@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>dotbeam scanner</title>
+    <style>
+        *, *::before, *::after {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #0a0a1a;
+            color: #ffffff;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            height: 100vh;
+            width: 100vw;
+            overflow: hidden;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+            position: relative;
+        }
+
+        .viewport {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        #camera-feed {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        #overlay-canvas {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+
+        .ui-layer {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            align-items: center;
+            padding: 48px 24px;
+            pointer-events: none;
+            z-index: 10;
+        }
+
+        .header {
+            font-size: 14px;
+            font-weight: 300;
+            letter-spacing: 0.12em;
+            text-transform: lowercase;
+            color: rgba(255, 255, 255, 0.25);
+            user-select: none;
+            text-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+        }
+
+        .status {
+            font-size: 14px;
+            font-weight: 400;
+            color: rgba(255, 255, 255, 0.6);
+            text-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+            transition: color 0.3s ease;
+            padding-bottom: env(safe-area-inset-bottom, 0);
+        }
+
+        .status.complete {
+            color: rgba(130, 255, 180, 0.8);
+        }
+
+        .result-overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(10, 10, 26, 0.85);
+            z-index: 20;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.5s ease, visibility 0.5s ease;
+            padding: 24px;
+        }
+
+        .result-overlay.visible {
+            opacity: 1;
+            visibility: visible;
+        }
+
+        .result-card {
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 20px;
+            padding: 32px 28px;
+            max-width: 440px;
+            width: 100%;
+            text-align: center;
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            transform: translateY(12px);
+            transition: transform 0.5s ease;
+        }
+
+        .result-overlay.visible .result-card {
+            transform: translateY(0);
+        }
+
+        .result-card .label {
+            font-size: 12px;
+            font-weight: 400;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: rgba(255, 255, 255, 0.35);
+            margin-bottom: 16px;
+        }
+
+        .result-card .decoded-text {
+            font-size: 18px;
+            font-weight: 400;
+            line-height: 1.6;
+            color: rgba(255, 255, 255, 0.9);
+            word-break: break-word;
+            max-height: 50vh;
+            overflow-y: auto;
+        }
+
+        .result-card .decoded-text::-webkit-scrollbar {
+            width: 4px;
+        }
+
+        .result-card .decoded-text::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.15);
+            border-radius: 2px;
+        }
+
+        .camera-denied {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 16px;
+            padding: 32px;
+            text-align: center;
+            z-index: 30;
+        }
+
+        .camera-denied .icon {
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            border: 2px solid rgba(255, 255, 255, 0.15);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 8px;
+        }
+
+        .camera-denied .icon svg {
+            width: 22px;
+            height: 22px;
+            stroke: rgba(255, 255, 255, 0.4);
+            fill: none;
+            stroke-width: 1.5;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+        }
+
+        .camera-denied h2 {
+            font-size: 18px;
+            font-weight: 500;
+            color: rgba(255, 255, 255, 0.7);
+        }
+
+        .camera-denied p {
+            font-size: 14px;
+            font-weight: 300;
+            color: rgba(255, 255, 255, 0.35);
+            max-width: 320px;
+            line-height: 1.6;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        @media (max-width: 480px) {
+            .ui-layer {
+                padding: 36px 16px;
+            }
+
+            .result-card {
+                padding: 24px 20px;
+                border-radius: 16px;
+            }
+
+            .result-card .decoded-text {
+                font-size: 16px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="viewport">
+        <video id="camera-feed" autoplay playsinline muted></video>
+        <canvas id="overlay-canvas"></canvas>
+    </div>
+
+    <div class="ui-layer">
+        <div class="header">dotbeam scanner</div>
+        <div class="status" id="status-label">Scanning...</div>
+    </div>
+
+    <div class="result-overlay" id="result-overlay">
+        <div class="result-card">
+            <div class="label">Received</div>
+            <div class="decoded-text" id="decoded-text"></div>
+        </div>
+    </div>
+
+    <div class="camera-denied hidden" id="camera-denied">
+        <div class="icon">
+            <svg viewBox="0 0 24 24">
+                <path d="M1 1l22 22"/>
+                <path d="M21 21H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h3l2-3h6"/>
+                <path d="M21 8v11"/>
+                <path d="M15.28 12.73a4 4 0 1 1-5.56-5.56"/>
+            </svg>
+        </div>
+        <h2>Camera access needed</h2>
+        <p>dotbeam needs access to your camera to scan the dot constellation. Please allow camera access in your browser settings and reload this page.</p>
+    </div>
+
+    <script src="/static/dotbeam-core.js"></script>
+    <script src="/static/scanner.js"></script>
+    <script>
+        (function () {
+            var video = document.getElementById("camera-feed");
+            var overlayCanvas = document.getElementById("overlay-canvas");
+            var statusLabel = document.getElementById("status-label");
+            var resultOverlay = document.getElementById("result-overlay");
+            var decodedText = document.getElementById("decoded-text");
+            var cameraDenied = document.getElementById("camera-denied");
+
+            var scanner = null;
+            var completed = false;
+
+            function resizeOverlay() {
+                var w = window.innerWidth;
+                var h = window.innerHeight;
+                var dpr = window.devicePixelRatio || 1;
+                overlayCanvas.width = w * dpr;
+                overlayCanvas.height = h * dpr;
+                overlayCanvas.style.width = w + "px";
+                overlayCanvas.style.height = h + "px";
+
+                var ctx = overlayCanvas.getContext("2d");
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            }
+
+            function drawProgressRing(progress) {
+                var ctx = overlayCanvas.getContext("2d");
+                var w = window.innerWidth;
+                var h = window.innerHeight;
+                var dpr = window.devicePixelRatio || 1;
+
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                ctx.clearRect(0, 0, w, h);
+
+                var centerX = w / 2;
+                var centerY = h / 2;
+                var radius = Math.min(w, h) * 0.28;
+                var lineWidth = 2.5;
+
+                // Background ring
+                ctx.beginPath();
+                ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+                ctx.strokeStyle = "rgba(255, 255, 255, 0.08)";
+                ctx.lineWidth = lineWidth;
+                ctx.stroke();
+
+                // Progress ring
+                if (progress > 0) {
+                    var startAngle = -Math.PI / 2;
+                    var endAngle = startAngle + (Math.PI * 2 * progress);
+
+                    ctx.beginPath();
+                    ctx.arc(centerX, centerY, radius, startAngle, endAngle);
+                    ctx.strokeStyle = "rgba(130, 255, 180, 0.6)";
+                    ctx.lineWidth = lineWidth;
+                    ctx.lineCap = "round";
+                    ctx.stroke();
+                }
+            }
+
+            function updateProgress(progress) {
+                if (completed) return;
+
+                drawProgressRing(progress);
+
+                var percent = Math.round(progress * 100);
+                if (percent === 0) {
+                    statusLabel.textContent = "Scanning...";
+                } else {
+                    statusLabel.textContent = percent + "% received";
+                }
+            }
+
+            function showResult(text) {
+                completed = true;
+                statusLabel.textContent = "Complete!";
+                statusLabel.classList.add("complete");
+                decodedText.textContent = text;
+                resultOverlay.classList.add("visible");
+                drawProgressRing(1);
+            }
+
+            function showCameraDenied() {
+                cameraDenied.classList.remove("hidden");
+                statusLabel.textContent = "";
+            }
+
+            function init() {
+                resizeOverlay();
+                window.addEventListener("resize", resizeOverlay);
+
+                drawProgressRing(0);
+
+                try {
+                    scanner = new DotbeamScanner(video, overlayCanvas, {
+                        onProgress: updateProgress,
+                        onComplete: showResult
+                    });
+                    scanner.start().catch(function (err) {
+                        console.error("Scanner failed to start:", err);
+                        if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+                            showCameraDenied();
+                        } else {
+                            statusLabel.textContent = "Unable to access camera";
+                        }
+                    });
+                } catch (err) {
+                    console.error("Failed to initialize scanner:", err);
+                    statusLabel.textContent = "Scanner initialization failed";
+                }
+            }
+
+            if (document.readyState === "loading") {
+                document.addEventListener("DOMContentLoaded", init);
+            } else {
+                init();
+            }
+        })();
+    </script>
+</body>
+</html>

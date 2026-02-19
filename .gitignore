@@ -1,0 +1,29 @@
+# Binaries
+dotbeam-demo
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go
+vendor/
+
+# JS
+js/node_modules/
+js/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# TLS certs (generated at runtime)
+*.pem
+*.crt
+*.key

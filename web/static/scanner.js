@@ -1,0 +1,644 @@
+// scanner.js — Camera capture and dot detection for dotbeam.
+// Opens the rear camera, detects anchor dots, samples data dot colors,
+// matches them to the palette, and reconstructs the transmitted payload.
+// No dependencies beyond dotbeam-core.js (window.DotbeamCore).
+
+(function () {
+  "use strict";
+
+  var palette = DotbeamCore.colors;
+
+  // ── Helpers ────────────────────────────────────────────────────────
+
+  /** Euclidean distance squared in RGB space. */
+  function colorDistSq(r1, g1, b1, r2, g2, b2) {
+    var dr = r1 - r2;
+    var dg = g1 - g2;
+    var db = b1 - b2;
+    return dr * dr + dg * dg + db * db;
+  }
+
+  /** Return palette index of the nearest color. */
+  function matchColor(r, g, b) {
+    var bestIdx = 0;
+    var bestDist = Infinity;
+    for (var i = 0; i < palette.length; i++) {
+      var d = colorDistSq(r, g, b, palette[i].r, palette[i].g, palette[i].b);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }
+
+  /** Distance between two 2D points. */
+  function dist(a, b) {
+    var dx = a.x - b.x;
+    var dy = a.y - b.y;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  /** Centroid of a set of points. */
+  function centroid(points) {
+    var sx = 0,
+      sy = 0;
+    for (var i = 0; i < points.length; i++) {
+      sx += points[i].x;
+      sy += points[i].y;
+    }
+    return { x: sx / points.length, y: sy / points.length };
+  }
+
+  // ── Blob detection for anchors ─────────────────────────────────────
+
+  /**
+   * Simple bright-white blob finder.
+   * Scans the image data looking for clusters of very bright pixels (close
+   * to white). Returns an array of {x, y, size} blobs sorted by size
+   * descending.
+   */
+  function findWhiteBlobs(imageData, width, height) {
+    var data = imageData.data;
+    // Threshold: all channels > 200
+    var THRESHOLD = 200;
+    var CELL_SIZE = 8; // grid cell size for clustering
+
+    var gridW = Math.ceil(width / CELL_SIZE);
+    var gridH = Math.ceil(height / CELL_SIZE);
+    var grid = new Uint8Array(gridW * gridH);
+
+    // Mark grid cells that contain bright-white pixels
+    for (var y = 0; y < height; y += 2) {
+      for (var x = 0; x < width; x += 2) {
+        var idx = (y * width + x) * 4;
+        var r = data[idx];
+        var g = data[idx + 1];
+        var b = data[idx + 2];
+        if (r > THRESHOLD && g > THRESHOLD && b > THRESHOLD) {
+          var gx = Math.floor(x / CELL_SIZE);
+          var gy = Math.floor(y / CELL_SIZE);
+          grid[gy * gridW + gx] = 1;
+        }
+      }
+    }
+
+    // Flood-fill connected components
+    var visited = new Uint8Array(gridW * gridH);
+    var blobs = [];
+
+    for (var gy2 = 0; gy2 < gridH; gy2++) {
+      for (var gx2 = 0; gx2 < gridW; gx2++) {
+        var gi = gy2 * gridW + gx2;
+        if (grid[gi] && !visited[gi]) {
+          // BFS flood fill
+          var queue = [gi];
+          visited[gi] = 1;
+          var cells = [];
+
+          while (queue.length > 0) {
+            var ci = queue.shift();
+            var cx = ci % gridW;
+            var cy = Math.floor(ci / gridW);
+            cells.push({ x: cx, y: cy });
+
+            // 4-connected neighbors
+            var neighbors = [
+              cy > 0 ? (cy - 1) * gridW + cx : -1,
+              cy < gridH - 1 ? (cy + 1) * gridW + cx : -1,
+              cx > 0 ? cy * gridW + (cx - 1) : -1,
+              cx < gridW - 1 ? cy * gridW + (cx + 1) : -1,
+            ];
+            for (var ni = 0; ni < neighbors.length; ni++) {
+              var n = neighbors[ni];
+              if (n >= 0 && grid[n] && !visited[n]) {
+                visited[n] = 1;
+                queue.push(n);
+              }
+            }
+          }
+
+          // Blob centroid in pixel coords
+          if (cells.length >= 2) {
+            var bx = 0,
+              by = 0;
+            for (var ci2 = 0; ci2 < cells.length; ci2++) {
+              bx += cells[ci2].x * CELL_SIZE + CELL_SIZE / 2;
+              by += cells[ci2].y * CELL_SIZE + CELL_SIZE / 2;
+            }
+            blobs.push({
+              x: bx / cells.length,
+              y: by / cells.length,
+              size: cells.length,
+            });
+          }
+        }
+      }
+    }
+
+    // Sort by size descending
+    blobs.sort(function (a, b) {
+      return b.size - a.size;
+    });
+
+    return blobs;
+  }
+
+  /**
+   * Given 3 blobs, verify they form an approximately equilateral triangle.
+   * Returns true if the side lengths are within 30% of each other.
+   */
+  function isEquilateralTriangle(a, b, c) {
+    var d1 = dist(a, b);
+    var d2 = dist(b, c);
+    var d3 = dist(a, c);
+    var avg = (d1 + d2 + d3) / 3;
+    if (avg < 10) return false; // too small
+    var tolerance = 0.3;
+    return (
+      Math.abs(d1 - avg) / avg < tolerance &&
+      Math.abs(d2 - avg) / avg < tolerance &&
+      Math.abs(d3 - avg) / avg < tolerance
+    );
+  }
+
+  /**
+   * Given 3 anchor points (detected blobs), determine the rotation and
+   * scale of the dotbeam pattern.
+   *
+   * The anchors are at known angles (270deg, 30deg, 150deg) at radius
+   * 0.82 in the pattern's coordinate system.
+   *
+   * Returns { center, scale, rotation } or null if detection failed.
+   */
+  function deriveTransform(blobs) {
+    if (blobs.length < 3) return null;
+
+    // Take the 3 largest blobs
+    var candidates = blobs.slice(0, 3);
+    if (!isEquilateralTriangle(candidates[0], candidates[1], candidates[2])) {
+      return null;
+    }
+
+    // Center is the centroid of the triangle
+    var center = centroid(candidates);
+
+    // Average distance from center to anchors is the pixel radius
+    // corresponding to the pattern anchor radius of 0.82
+    var avgDist = 0;
+    for (var i = 0; i < 3; i++) {
+      avgDist += dist(center, candidates[i]);
+    }
+    avgDist /= 3;
+
+    var scale = avgDist / DotbeamCore.ANCHOR_RADIUS;
+
+    // Determine rotation: the anchor at 270deg (top, in math coords that
+    // is straight up / -Y in screen coords) should be the topmost blob.
+    // Find the anchor with the smallest Y (topmost in screen coords).
+    var topIdx = 0;
+    for (var j = 1; j < 3; j++) {
+      if (candidates[j].y < candidates[topIdx].y) {
+        topIdx = j;
+      }
+    }
+
+    // The top anchor corresponds to 270deg in pattern space.
+    // Compute the actual angle from center to the detected top blob.
+    var topBlob = candidates[topIdx];
+    var detectedAngle = Math.atan2(
+      topBlob.y - center.y,
+      topBlob.x - center.x
+    );
+    // Expected angle for the 270deg anchor: 270deg = -PI/2 = 3PI/2
+    var expectedAngle = (270 * Math.PI) / 180;
+    var rotation = detectedAngle - expectedAngle;
+
+    return {
+      center: center,
+      scale: scale,
+      rotation: rotation,
+    };
+  }
+
+  // ── Dot sampling ───────────────────────────────────────────────────
+
+  /**
+   * Given a transform and layout, sample pixel colors at each dot
+   * position and return an array of palette indices.
+   */
+  function sampleDots(imageData, width, transform, layoutData) {
+    var data = imageData.data;
+    var center = transform.center;
+    var scale = transform.scale;
+    var rotation = transform.rotation;
+
+    var allDots = [];
+    for (var ri = 0; ri < layoutData.rings.length; ri++) {
+      var ring = layoutData.rings[ri];
+      for (var di = 0; di < ring.dots.length; di++) {
+        allDots.push(ring.dots[di]);
+      }
+    }
+
+    var results = [];
+    var sampleRadius = Math.max(1, Math.floor(scale * 0.015));
+
+    for (var i = 0; i < allDots.length; i++) {
+      var dot = allDots[i];
+
+      // Transform pattern coordinates to pixel coordinates.
+      // Apply rotation then scale and translate.
+      var cosR = Math.cos(rotation);
+      var sinR = Math.sin(rotation);
+      var rx = dot.x * cosR - dot.y * sinR;
+      var ry = dot.x * sinR + dot.y * cosR;
+      var px = Math.round(center.x + rx * scale);
+      var py = Math.round(center.y + ry * scale);
+
+      // Sample a small area around the dot center and average
+      var totalR = 0,
+        totalG = 0,
+        totalB = 0,
+        count = 0;
+
+      for (var sy = -sampleRadius; sy <= sampleRadius; sy++) {
+        for (var sx = -sampleRadius; sx <= sampleRadius; sx++) {
+          var spx = px + sx;
+          var spy = py + sy;
+          if (spx >= 0 && spx < width && spy >= 0 && spy < imageData.height) {
+            var idx = (spy * width + spx) * 4;
+            totalR += data[idx];
+            totalG += data[idx + 1];
+            totalB += data[idx + 2];
+            count++;
+          }
+        }
+      }
+
+      if (count > 0) {
+        results.push(
+          matchColor(
+            Math.round(totalR / count),
+            Math.round(totalG / count),
+            Math.round(totalB / count)
+          )
+        );
+      } else {
+        results.push(0);
+      }
+    }
+
+    return results;
+  }
+
+  // ── JS Decoder ─────────────────────────────────────────────────────
+
+  /**
+   * Minimal decoder that reassembles frames into a payload.
+   *
+   * Each frame's dot data starts with a 2-byte header:
+   *   byte 0: frame index (0-based)
+   *   byte 1: total number of frames
+   *
+   * The remaining bytes are payload data.
+   *
+   * With 3 bits per dot, every group of 8 dots encodes 3 bytes
+   * (8 dots * 3 bits = 24 bits = 3 bytes).
+   */
+  function Decoder() {
+    this._frames = {}; // frameIndex -> Uint8Array of payload bytes
+    this._totalFrames = null;
+    this._received = 0;
+  }
+
+  /** Convert an array of palette indices (0-7, 3 bits each) into bytes. */
+  Decoder.prototype._dotsToBytes = function (dotValues) {
+    // Pack 3-bit values into a bit stream, then extract bytes.
+    var bits = [];
+    for (var i = 0; i < dotValues.length; i++) {
+      var val = dotValues[i] & 0x07; // 3 bits
+      bits.push((val >> 2) & 1);
+      bits.push((val >> 1) & 1);
+      bits.push(val & 1);
+    }
+
+    var bytes = [];
+    for (var b = 0; b + 7 < bits.length; b += 8) {
+      var byte = 0;
+      for (var bi = 0; bi < 8; bi++) {
+        byte = (byte << 1) | bits[b + bi];
+      }
+      bytes.push(byte);
+    }
+    return new Uint8Array(bytes);
+  };
+
+  /**
+   * Feed a frame's dot values into the decoder.
+   * Returns { complete: bool, progress: number (0-1) }.
+   */
+  Decoder.prototype.addFrame = function (dotValues) {
+    var rawBytes = this._dotsToBytes(dotValues);
+    if (rawBytes.length < 2) {
+      return { complete: false, progress: this.progress() };
+    }
+
+    var frameIndex = rawBytes[0];
+    var totalFrames = rawBytes[1];
+
+    if (totalFrames === 0) {
+      return { complete: false, progress: 0 };
+    }
+
+    this._totalFrames = totalFrames;
+
+    // Payload is everything after the 2-byte header
+    var payload = rawBytes.slice(2);
+
+    if (!this._frames[frameIndex]) {
+      this._frames[frameIndex] = payload;
+      this._received++;
+    }
+
+    return {
+      complete: this._received >= this._totalFrames,
+      progress: this.progress(),
+    };
+  };
+
+  /** Current progress from 0 to 1. */
+  Decoder.prototype.progress = function () {
+    if (!this._totalFrames) return 0;
+    return Math.min(this._received / this._totalFrames, 1);
+  };
+
+  /** Reassemble all frames into the final payload. */
+  Decoder.prototype.reassemble = function () {
+    if (!this._totalFrames) return new Uint8Array(0);
+
+    var chunks = [];
+    for (var i = 0; i < this._totalFrames; i++) {
+      if (this._frames[i]) {
+        chunks.push(this._frames[i]);
+      }
+    }
+
+    // Concatenate
+    var totalLen = 0;
+    for (var j = 0; j < chunks.length; j++) {
+      totalLen += chunks[j].length;
+    }
+    var result = new Uint8Array(totalLen);
+    var offset = 0;
+    for (var k = 0; k < chunks.length; k++) {
+      result.set(chunks[k], offset);
+      offset += chunks[k].length;
+    }
+
+    return result;
+  };
+
+  /** Decode the final payload as a UTF-8 string. */
+  Decoder.prototype.getText = function () {
+    var bytes = this.reassemble();
+    // Use TextDecoder if available
+    if (typeof TextDecoder !== "undefined") {
+      return new TextDecoder("utf-8").decode(bytes);
+    }
+    // Fallback
+    var str = "";
+    for (var i = 0; i < bytes.length; i++) {
+      str += String.fromCharCode(bytes[i]);
+    }
+    return str;
+  };
+
+  /** Reset the decoder for a new scan. */
+  Decoder.prototype.reset = function () {
+    this._frames = {};
+    this._totalFrames = null;
+    this._received = 0;
+  };
+
+  // ── DotbeamScanner ─────────────────────────────────────────────────
+
+  /**
+   * @param {HTMLVideoElement} videoElement — displays the camera feed
+   * @param {HTMLCanvasElement} overlayCanvas — drawn over the video for
+   *        progress ring and other UI
+   */
+  function DotbeamScanner(videoElement, overlayCanvas, options) {
+    this._video = videoElement;
+    this._overlay = overlayCanvas;
+    this._overlayCtx = overlayCanvas.getContext("2d");
+
+    this._offscreen = document.createElement("canvas");
+    this._offscreenCtx = this._offscreen.getContext("2d", {
+      willReadFrequently: true,
+    });
+
+    this._stream = null;
+    this._rafId = null;
+    this._running = false;
+    this._decoder = new Decoder();
+
+    this._layoutData = DotbeamCore.layout(DotbeamCore.defaultConfig());
+
+    // Callbacks (can be set via options or .onProgress()/.onComplete()/.onError())
+    var opts = options || {};
+    this._onProgress = opts.onProgress || null;
+    this._onComplete = opts.onComplete || null;
+    this._onError = opts.onError || null;
+
+    // Scan timing
+    this._lastScanTime = 0;
+    this._scanIntervalMs = 100; // scan at ~10 Hz
+  }
+
+  /** Register a progress callback: function(progress: 0-1) */
+  DotbeamScanner.prototype.onProgress = function (cb) {
+    this._onProgress = cb;
+  };
+
+  /** Register a completion callback: function(text: string) */
+  DotbeamScanner.prototype.onComplete = function (cb) {
+    this._onComplete = cb;
+  };
+
+  /** Register an error callback: function(error: Error) */
+  DotbeamScanner.prototype.onError = function (cb) {
+    this._onError = cb;
+  };
+
+  /** Start the camera and begin scanning. Returns a Promise. */
+  DotbeamScanner.prototype.start = function () {
+    if (this._running) return Promise.resolve();
+    this._running = true;
+    this._decoder.reset();
+
+    var self = this;
+    var constraints = {
+      video: {
+        facingMode: "environment",
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+      },
+      audio: false,
+    };
+
+    return navigator.mediaDevices
+      .getUserMedia(constraints)
+      .then(function (stream) {
+        self._stream = stream;
+        self._video.srcObject = stream;
+        self._video.setAttribute("playsinline", "true");
+        self._video.play();
+
+        // Wait for video to be ready
+        self._video.addEventListener("loadedmetadata", function onMeta() {
+          self._video.removeEventListener("loadedmetadata", onMeta);
+          self._offscreen.width = self._video.videoWidth;
+          self._offscreen.height = self._video.videoHeight;
+          self._tick(performance.now());
+        });
+      })
+      .catch(function (err) {
+        self._running = false;
+        if (self._onError) {
+          self._onError(err);
+        }
+        throw err; // re-throw so .catch() on start() works
+      });
+  };
+
+  /** Stop the camera and scanning. */
+  DotbeamScanner.prototype.stop = function () {
+    this._running = false;
+
+    if (this._rafId !== null) {
+      cancelAnimationFrame(this._rafId);
+      this._rafId = null;
+    }
+
+    if (this._stream) {
+      var tracks = this._stream.getTracks();
+      for (var i = 0; i < tracks.length; i++) {
+        tracks[i].stop();
+      }
+      this._stream = null;
+    }
+
+    this._video.srcObject = null;
+  };
+
+  // ── Internal methods ───────────────────────────────────────────────
+
+  DotbeamScanner.prototype._tick = function (now) {
+    if (!this._running) return;
+
+    // Throttle scanning
+    if (now - this._lastScanTime >= this._scanIntervalMs) {
+      this._lastScanTime = now;
+      this._scan();
+    }
+
+    this._drawOverlay();
+
+    this._rafId = requestAnimationFrame(this._tick.bind(this));
+  };
+
+  DotbeamScanner.prototype._scan = function () {
+    var vw = this._video.videoWidth;
+    var vh = this._video.videoHeight;
+    if (!vw || !vh) return;
+
+    // Capture frame to offscreen canvas
+    this._offscreenCtx.drawImage(this._video, 0, 0, vw, vh);
+    var imageData = this._offscreenCtx.getImageData(0, 0, vw, vh);
+
+    // Find white anchor blobs
+    var blobs = findWhiteBlobs(imageData, vw, vh);
+    if (blobs.length < 3) return;
+
+    // Derive transform from anchors
+    var transform = deriveTransform(blobs);
+    if (!transform) return;
+
+    // Sample dot colors
+    var dotValues = sampleDots(imageData, vw, transform, this._layoutData);
+
+    // Feed to decoder
+    var result = this._decoder.addFrame(dotValues);
+
+    if (this._onProgress) {
+      this._onProgress(result.progress);
+    }
+
+    if (result.complete) {
+      this._running = false;
+      if (this._onComplete) {
+        this._onComplete(this._decoder.getText());
+      }
+    }
+  };
+
+  DotbeamScanner.prototype._drawOverlay = function () {
+    var canvas = this._overlay;
+    var ctx = this._overlayCtx;
+
+    // Match overlay size to its display size
+    var rect = canvas.getBoundingClientRect();
+    var dpr = window.devicePixelRatio || 1;
+    if (
+      canvas.width !== Math.round(rect.width * dpr) ||
+      canvas.height !== Math.round(rect.height * dpr)
+    ) {
+      canvas.width = Math.round(rect.width * dpr);
+      canvas.height = Math.round(rect.height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    var w = rect.width;
+    var h = rect.height;
+    ctx.clearRect(0, 0, w, h);
+
+    // Draw progress ring
+    var progress = this._decoder.progress();
+    var cx = w / 2;
+    var cy = h / 2;
+    var ringRadius = Math.min(w, h) * 0.42;
+    var lineWidth = 4;
+
+    // Background ring
+    ctx.strokeStyle = "rgba(255,255,255,0.15)";
+    ctx.lineWidth = lineWidth;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.arc(cx, cy, ringRadius, 0, 2 * Math.PI);
+    ctx.stroke();
+
+    // Progress arc
+    if (progress > 0) {
+      var startAngle = -Math.PI / 2;
+      var endAngle = startAngle + progress * 2 * Math.PI;
+      ctx.strokeStyle = "#44FF44";
+      ctx.lineWidth = lineWidth;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.arc(cx, cy, ringRadius, startAngle, endAngle);
+      ctx.stroke();
+    }
+
+    // Progress text
+    var pct = Math.round(progress * 100);
+    ctx.fillStyle = "rgba(255,255,255,0.8)";
+    ctx.font = "16px monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(pct + "%", cx, cy + ringRadius + 24);
+  };
+
+  // ── Export ──────────────────────────────────────────────────────────
+  window.DotbeamScanner = DotbeamScanner;
+})();

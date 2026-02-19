@@ -1,0 +1,32 @@
+{
+  "name": "dotbeam",
+  "version": "0.1.0",
+  "description": "Beautiful animated visual data transfer. Screen-to-camera, no network required.",
+  "main": "src/index.js",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src/"
+  ],
+  "scripts": {
+    "test": "node --test src/*.test.js"
+  },
+  "keywords": [
+    "visual",
+    "data-transfer",
+    "animation",
+    "dots",
+    "constellation",
+    "camera",
+    "encoding"
+  ],
+  "author": "Satinder Grewal",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/satindergrewal/dotbeam.git",
+    "directory": "js"
+  }
+}
