@@ -123,12 +123,12 @@
    */
   function findWhiteBlobs(imageData, width, height) {
     var data = imageData.data;
-    var THRESHOLD = 180; // raised — 160 was too permissive
+    var THRESHOLD = 200; // aggressive — only truly white areas pass
     var CELL_SIZE = 8;
 
     // Maximum blob size in grid cells.  A real anchor dot at typical viewing
     // distance produces ≤ 30 cells.  Blobs bigger than this are screen glare.
-    var MAX_BLOB_CELLS = 60;
+    var MAX_BLOB_CELLS = 50;
 
     var gridW = Math.ceil(width / CELL_SIZE);
     var gridH = Math.ceil(height / CELL_SIZE);
@@ -182,8 +182,8 @@
             }
           }
 
-          // Reject blobs that are too small or too large
-          if (cells.length < 2 || cells.length > MAX_BLOB_CELLS) continue;
+          // Reject blobs that are too small (noise/text) or too large (glare)
+          if (cells.length < 4 || cells.length > MAX_BLOB_CELLS) continue;
 
           var bx = 0,
             by = 0;
@@ -645,6 +645,11 @@
     this._lastScanTime = 0;
     this._scanIntervalMs = 100; // scan at ~10 Hz
 
+    // Transform caching: once a valid transform produces a sensible frame
+    // header, lock it in.  Re-derive only if anchors appear to have moved.
+    this._cachedTransform = null;  // last known-good transform
+    this._goodFrameCount = 0;     // consecutive good frames with this transform
+
     // Debug state (always collected; drawn when debug=true in URL)
     this._debug = /[?&]debug/.test(window.location.search);
     this._dbgBlobs = null;         // detected blobs (all)
@@ -780,20 +785,58 @@
     this._dbgBlobCount = blobs.length;
     this._dbgBlobs = blobs.slice(0, 8);
 
-    if (blobs.length < 3) {
-      this._dbgStatus = "no-blobs";
-      this._dbgTransform = null;
-      this._dbgDotPositions = null;
-      return;
+    // ── Derive or reuse transform ──────────────────────────────────
+    // If we have a cached good transform, validate it's still roughly
+    // correct by checking that the anchor positions haven't moved much.
+    // This prevents the scanner from "losing" the pattern when blob
+    // detection returns too many false positives.
+    var transform = null;
+
+    if (blobs.length >= 3) {
+      var freshTransform = deriveTransform(blobs);
+
+      if (freshTransform && this._cachedTransform) {
+        // Accept the fresh transform only if it agrees with the cached one
+        // (center within 15% of scale, scale within 20%, rotation within 15°).
+        var cdx = freshTransform.center.x - this._cachedTransform.center.x;
+        var cdy = freshTransform.center.y - this._cachedTransform.center.y;
+        var centerDrift = Math.sqrt(cdx * cdx + cdy * cdy);
+        var scaleDrift = Math.abs(freshTransform.scale - this._cachedTransform.scale);
+        var rotDrift = Math.abs(freshTransform.rotation - this._cachedTransform.rotation);
+
+        var maxCenterDrift = this._cachedTransform.scale * 0.15;
+        var maxScaleDrift = this._cachedTransform.scale * 0.20;
+        var maxRotDrift = 15 * Math.PI / 180; // 15 degrees
+
+        if (centerDrift < maxCenterDrift &&
+            scaleDrift < maxScaleDrift &&
+            rotDrift < maxRotDrift) {
+          // Fresh transform is consistent — update the cache
+          transform = freshTransform;
+          this._cachedTransform = freshTransform;
+        } else {
+          // Fresh transform jumped wildly — likely wrong anchors.
+          // Keep using the cached transform.
+          transform = this._cachedTransform;
+        }
+      } else if (freshTransform) {
+        // No cached transform yet — use the fresh one and validate
+        // it by checking the center sample (should be dark).
+        transform = freshTransform;
+        // We'll cache it after validating the decoded header below.
+      }
     }
 
-    // Derive transform from anchors
-    var transform = deriveTransform(blobs);
+    // Fall back to cached transform if blob detection failed
+    if (!transform && this._cachedTransform) {
+      transform = this._cachedTransform;
+    }
+
     this._dbgTransform = transform;
     this._dbgAnchors = transform ? transform.anchors : null;
 
     if (!transform) {
-      this._dbgStatus = "no-triangle";
+      this._dbgStatus = blobs.length < 3 ? "no-blobs" : "no-triangle";
       this._dbgDotPositions = null;
       return;
     }
@@ -801,7 +844,6 @@
     this._dbgStatus = "sampling";
 
     // Sample the pattern center — should be dark background.
-    // This validates that our coordinate mapping reaches the right area.
     var sampleR = Math.max(2, Math.floor(transform.scale * 0.025));
     this._dbgCenterSample = samplePoint(
       imageData, vw,
@@ -810,8 +852,6 @@
     );
 
     // White-balance calibration from anchor dots.
-    // The anchors are known white — comparing expected vs actual reveals
-    // the camera's per-channel colour shift.
     var wbGain = calibrateWhiteBalance(
       imageData, vw, transform.anchors, sampleR
     );
@@ -844,30 +884,43 @@
         colorIdx: dotValues[di2],
       });
     }
-    // Track d0 position for the prominent debug marker
     if (this._dbgDotPositions.length > 0) {
       this._dbgD0Pos = this._dbgDotPositions[0];
     }
 
-    // Feed to decoder
-    var result = this._decoder.addFrame(dotValues);
-    this._dbgStatus = "decoded";
-
-    // Store header info
+    // Decode the raw header to check validity BEFORE feeding to decoder
     var rawBytes = this._decoder._dotsToBytes(dotValues);
+    var headerValid = false;
     if (rawBytes.length >= 2) {
-      this._dbgHeader = { frameIndex: rawBytes[0], totalFrames: rawBytes[1] };
+      var fi = rawBytes[0];
+      var ft = rawBytes[1];
+      this._dbgHeader = { frameIndex: fi, totalFrames: ft };
+      headerValid = ft > 0 && ft <= 200 && fi < ft;
     }
 
-    if (this._onProgress) {
-      this._onProgress(result.progress);
+    // If header is valid, cache this transform as known-good
+    if (headerValid && !this._cachedTransform) {
+      this._cachedTransform = transform;
     }
 
-    if (result.complete) {
-      this._running = false;
-      if (this._onComplete) {
-        this._onComplete(this._decoder.getText());
+    // Only feed valid frames to the decoder (skip garbage)
+    if (headerValid) {
+      var result = this._decoder.addFrame(dotValues);
+      this._dbgStatus = "decoded";
+      this._goodFrameCount++;
+
+      if (this._onProgress) {
+        this._onProgress(result.progress);
       }
+
+      if (result.complete) {
+        this._running = false;
+        if (this._onComplete) {
+          this._onComplete(this._decoder.getText());
+        }
+      }
+    } else {
+      this._dbgStatus = "bad-header";
     }
   };
 
@@ -962,8 +1015,10 @@
     ctx.textBaseline = "top";
 
     var debugLines = [
-      "status: " + this._dbgStatus,
-      "blobs: " + this._dbgBlobCount,
+      "status: " + this._dbgStatus +
+        (this._cachedTransform ? " [locked]" : ""),
+      "blobs: " + this._dbgBlobCount +
+        " good:" + this._goodFrameCount,
     ];
     if (this._dbgTransform) {
       debugLines.push(
