@@ -279,66 +279,81 @@
    *
    * Returns { center, scale, rotation } or null if detection failed.
    */
-  function deriveTransform(blobs) {
+  /**
+   * Maximum center brightness for a valid anchor triple.
+   * The pattern background is #0a0a1a — through a camera the center
+   * should read well below 80.  Wrong triples (UI text, reflections)
+   * produce centers with brightness 80-200+.
+   */
+  var MAX_CENTER_BRIGHTNESS = 80;
+
+  function deriveTransform(blobs, imageData, imgWidth) {
     if (blobs.length < 3) return null;
 
-    // Search all filtered blobs (up to 10) for an equilateral triple.
-    var candidates = null;
+    // Search all filtered blobs (up to 10) for an equilateral triple
+    // whose centroid sits on dark background (the real pattern center).
     var limit = Math.min(blobs.length, 10);
-    outer:
     for (var i = 0; i < limit - 2; i++) {
       for (var j = i + 1; j < limit - 1; j++) {
         for (var k = j + 1; k < limit; k++) {
-          if (isEquilateralTriangle(blobs[i], blobs[j], blobs[k])) {
-            candidates = [blobs[i], blobs[j], blobs[k]];
-            break outer;
+          if (!isEquilateralTriangle(blobs[i], blobs[j], blobs[k])) continue;
+
+          var candidates = [blobs[i], blobs[j], blobs[k]];
+          var center = centroid(candidates);
+
+          // Verify the center of this triple is dark (pattern background).
+          // This filters out false triples formed by UI text, screen glare, etc.
+          if (imageData) {
+            var cs = samplePoint(
+              imageData, imgWidth,
+              Math.round(center.x), Math.round(center.y), 3
+            );
+            var brightness = (cs.r + cs.g + cs.b) / 3;
+            if (brightness > MAX_CENTER_BRIGHTNESS) continue;
           }
+
+          // Average distance from center to anchors is the pixel radius
+          // corresponding to the pattern anchor radius of 0.82
+          var avgDist = 0;
+          for (var i2 = 0; i2 < 3; i2++) {
+            avgDist += dist(center, candidates[i2]);
+          }
+          avgDist /= 3;
+
+          var scale = avgDist / DotbeamCore.ANCHOR_RADIUS;
+
+          // The 270deg anchor is the bottommost blob (largest Y in screen coords).
+          var bottomIdx = 0;
+          for (var m = 1; m < 3; m++) {
+            if (candidates[m].y > candidates[bottomIdx].y) {
+              bottomIdx = m;
+            }
+          }
+
+          // Compute actual angle from center to the bottom blob in camera coords.
+          var bottomBlob = candidates[bottomIdx];
+          var detectedAngle = Math.atan2(
+            bottomBlob.y - center.y,
+            bottomBlob.x - center.x
+          );
+          // In screen coords, the 270deg anchor is at (0, +0.82) → angle PI/2
+          var expectedAngle = Math.PI / 2;
+          var rotation = detectedAngle - expectedAngle;
+
+          // Normalize to [-PI, PI]
+          while (rotation > Math.PI) rotation -= 2 * Math.PI;
+          while (rotation < -Math.PI) rotation += 2 * Math.PI;
+
+          return {
+            center: center,
+            scale: scale,
+            rotation: rotation,
+            anchors: candidates,
+          };
         }
       }
     }
-    if (!candidates) return null;
-
-    // Center is the centroid of the triangle
-    var center = centroid(candidates);
-
-    // Average distance from center to anchors is the pixel radius
-    // corresponding to the pattern anchor radius of 0.82
-    var avgDist = 0;
-    for (var i2 = 0; i2 < 3; i2++) {
-      avgDist += dist(center, candidates[i2]);
-    }
-    avgDist /= 3;
-
-    var scale = avgDist / DotbeamCore.ANCHOR_RADIUS;
-
-    // The 270deg anchor is the bottommost blob (largest Y in screen coords).
-    var bottomIdx = 0;
-    for (var m = 1; m < 3; m++) {
-      if (candidates[m].y > candidates[bottomIdx].y) {
-        bottomIdx = m;
-      }
-    }
-
-    // Compute actual angle from center to the bottom blob in camera coords.
-    var bottomBlob = candidates[bottomIdx];
-    var detectedAngle = Math.atan2(
-      bottomBlob.y - center.y,
-      bottomBlob.x - center.x
-    );
-    // In screen coords, the 270deg anchor is at (0, +0.82) → angle PI/2
-    var expectedAngle = Math.PI / 2;
-    var rotation = detectedAngle - expectedAngle;
-
-    // Normalize to [-PI, PI]
-    while (rotation > Math.PI) rotation -= 2 * Math.PI;
-    while (rotation < -Math.PI) rotation += 2 * Math.PI;
-
-    return {
-      center: center,
-      scale: scale,
-      rotation: rotation,
-      anchors: candidates, // the 3 blobs chosen as anchors
-    };
+    return null;
   }
 
   // ── Dot sampling ───────────────────────────────────────────────────
@@ -888,7 +903,7 @@
     var transform = null;
 
     if (blobs.length >= 3) {
-      var freshTransform = deriveTransform(blobs);
+      var freshTransform = deriveTransform(blobs, imageData, vw);
 
       if (freshTransform && this._cachedTransform) {
         // Accept the fresh transform only if it agrees with the cached one
