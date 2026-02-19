@@ -485,18 +485,21 @@
    * With 3 bits per dot, every group of 8 dots encodes 3 bytes
    * (8 dots * 3 bits = 24 bits = 3 bytes).
    */
+  // Minimum captures per frame before we trust the majority-voted result.
+  var MIN_VOTES = 5;
+
   function Decoder() {
-    this._frames = {}; // frameIndex -> Uint8Array of payload bytes
+    this._votes = {};       // frameIndex -> array of dotValues arrays
+    this._frames = {};      // frameIndex -> Uint8Array (majority-voted payload)
     this._totalFrames = null;
     this._received = 0;
   }
 
   /** Convert an array of palette indices (0-7, 3 bits each) into bytes. */
   Decoder.prototype._dotsToBytes = function (dotValues) {
-    // Pack 3-bit values into a bit stream, then extract bytes.
     var bits = [];
     for (var i = 0; i < dotValues.length; i++) {
-      var val = dotValues[i] & 0x07; // 3 bits
+      var val = dotValues[i] & 0x07;
       bits.push((val >> 2) & 1);
       bits.push((val >> 1) & 1);
       bits.push(val & 1);
@@ -514,7 +517,34 @@
   };
 
   /**
+   * Per-dot majority vote across multiple captures.
+   * For each dot position, pick the palette index that appears most often.
+   */
+  Decoder.prototype._majorityVote = function (captures) {
+    if (captures.length === 0) return [];
+    var numDots = captures[0].length;
+    var voted = new Array(numDots);
+
+    for (var d = 0; d < numDots; d++) {
+      // Count occurrences of each value (0-7)
+      var counts = [0, 0, 0, 0, 0, 0, 0, 0];
+      for (var c = 0; c < captures.length; c++) {
+        var v = captures[c][d] & 0x07;
+        counts[v]++;
+      }
+      // Pick the value with the highest count
+      var best = 0;
+      for (var v2 = 1; v2 < 8; v2++) {
+        if (counts[v2] > counts[best]) best = v2;
+      }
+      voted[d] = best;
+    }
+    return voted;
+  };
+
+  /**
    * Feed a frame's dot values into the decoder.
+   * Accumulates multiple captures per frame and uses majority voting.
    * Returns { complete: bool, progress: number (0-1) }.
    */
   Decoder.prototype.addFrame = function (dotValues) {
@@ -526,7 +556,7 @@
     var frameIndex = rawBytes[0];
     var totalFrames = rawBytes[1];
 
-    // Sanity checks: reject clearly invalid headers
+    // Sanity checks
     if (totalFrames === 0 || totalFrames > 200) {
       return { complete: false, progress: this.progress() };
     }
@@ -534,21 +564,38 @@
       return { complete: false, progress: this.progress() };
     }
 
-    // If totalFrames changes from what we've been tracking, the previous
-    // readings were likely noise — reset and start fresh.
+    // If totalFrames changes, reset
     if (this._totalFrames !== null && totalFrames !== this._totalFrames) {
+      this._votes = {};
       this._frames = {};
       this._received = 0;
     }
 
     this._totalFrames = totalFrames;
 
-    // Payload is everything after the 2-byte header
-    var payload = rawBytes.slice(2);
+    // Accumulate this capture as a vote for this frame
+    if (!this._votes[frameIndex]) {
+      this._votes[frameIndex] = [];
+    }
+    // Store a copy of the dot values (just the array portion, not debugRgb)
+    var dotsCopy = [];
+    for (var i = 0; i < dotValues.length; i++) {
+      dotsCopy.push(dotValues[i]);
+    }
+    this._votes[frameIndex].push(dotsCopy);
 
-    if (!this._frames[frameIndex]) {
+    // Once we have enough votes, compute the majority-voted payload
+    var numVotes = this._votes[frameIndex].length;
+    if (numVotes >= MIN_VOTES) {
+      var voted = this._majorityVote(this._votes[frameIndex]);
+      var votedBytes = this._dotsToBytes(voted);
+      var payload = votedBytes.slice(2);
+
+      if (!this._frames[frameIndex]) {
+        this._received++;
+      }
+      // Update with latest majority vote (improves with more captures)
       this._frames[frameIndex] = payload;
-      this._received++;
     }
 
     return {
@@ -560,7 +607,17 @@
   /** Current progress from 0 to 1. */
   Decoder.prototype.progress = function () {
     if (!this._totalFrames) return 0;
-    return Math.min(this._received / this._totalFrames, 1);
+    // Show partial progress: each frame goes from 0 to 1/totalFrames
+    // as it accumulates votes toward MIN_VOTES.
+    var total = 0;
+    for (var i = 0; i < this._totalFrames; i++) {
+      if (this._frames[i]) {
+        total += 1; // fully voted
+      } else if (this._votes[i]) {
+        total += Math.min(this._votes[i].length / MIN_VOTES, 0.99);
+      }
+    }
+    return Math.min(total / this._totalFrames, 1);
   };
 
   /** Reassemble all frames into the final payload. */
@@ -574,7 +631,6 @@
       }
     }
 
-    // Concatenate
     var totalLen = 0;
     for (var j = 0; j < chunks.length; j++) {
       totalLen += chunks[j].length;
@@ -592,11 +648,9 @@
   /** Decode the final payload as a UTF-8 string. */
   Decoder.prototype.getText = function () {
     var bytes = this.reassemble();
-    // Use TextDecoder if available
     if (typeof TextDecoder !== "undefined") {
       return new TextDecoder("utf-8").decode(bytes);
     }
-    // Fallback
     var str = "";
     for (var i = 0; i < bytes.length; i++) {
       str += String.fromCharCode(bytes[i]);
@@ -606,6 +660,7 @@
 
   /** Reset the decoder for a new scan. */
   Decoder.prototype.reset = function () {
+    this._votes = {};
     this._frames = {};
     this._totalFrames = null;
     this._received = 0;
@@ -1053,7 +1108,17 @@
         " total=" + this._dbgHeader.totalFrames
       );
     }
-    debugLines.push("recv: " + this._decoder._received);
+    // Show recv count and per-frame vote tallies
+    var voteInfo = "";
+    if (this._decoder._totalFrames) {
+      var parts = [];
+      for (var vi = 0; vi < this._decoder._totalFrames; vi++) {
+        var vc = this._decoder._votes[vi] ? this._decoder._votes[vi].length : 0;
+        parts.push(vc);
+      }
+      voteInfo = " v=[" + parts.join(",") + "]";
+    }
+    debugLines.push("recv: " + this._decoder._received + voteInfo);
     // Show first 6 dots' raw→corrected→matched colour index
     if (this._dbgDotRgb) {
       for (var dri = 0; dri < this._dbgDotRgb.length; dri++) {
