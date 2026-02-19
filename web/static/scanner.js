@@ -286,6 +286,7 @@
    * produce centers with brightness 80-200+.
    */
   var MAX_CENTER_BRIGHTNESS = 80;
+  var MIN_ANCHOR_BRIGHTNESS = 100;
 
   function deriveTransform(blobs, imageData, imgWidth) {
     if (blobs.length < 3) return null;
@@ -416,11 +417,8 @@
     var avgG = sumG / anchors.length;
     var avgB = sumB / anchors.length;
 
-    // If anchors are too dark (< 150 avg brightness), don't trust WB —
-    // we're likely sampling the wrong blobs or the image is underexposed.
-    // Also clamp gains to 1.5 max to avoid amplifying camera noise.
+    // If anchors are too dark, don't trust WB.
     var MAX_GAIN = 2.0;
-    var MIN_ANCHOR_BRIGHTNESS = 100;
     var avgBright = (avgR + avgG + avgB) / 3;
 
     var gr = 1, gg = 1, gb = 1;
@@ -1011,6 +1009,19 @@
       imageData, vw, transform.anchors, sampleR
     );
     this._dbgWB = wbGain;
+
+    // Gate: if anchors are too dark to be white, this transform is wrong.
+    // Don't sample dots, don't feed to decoder, don't cache.
+    var anchorBright = (wbGain.rawR + wbGain.rawG + wbGain.rawB) / 3;
+    if (anchorBright < MIN_ANCHOR_BRIGHTNESS) {
+      this._dbgStatus = "anchors-dark (" + Math.round(anchorBright) + ")";
+      // If this was the cached transform, evict it — it's clearly wrong.
+      if (this._cachedTransform) {
+        this._cachedTransform = null;
+        this._goodFrameCount = 0;
+      }
+      return;
+    }
 
     // Sample dot colors with WB correction
     var dotValues = sampleDots(
