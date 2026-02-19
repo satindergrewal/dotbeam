@@ -462,7 +462,11 @@
       }
     }
 
-    var sampleRadius = Math.max(2, Math.floor(scale * 0.038));
+    var sampleRadius = Math.max(2, Math.floor(scale * 0.03));
+    // Peak-seeking search radius: small enough to stay within the dot
+    // (dot rendered at 0.06 * scale ≈ 6% of scale; search at 3%).
+    var searchRadius = Math.max(3, Math.floor(scale * 0.03));
+    var searchStep = Math.max(2, Math.floor(searchRadius / 2));
     var cosR = Math.cos(rotation);
     var sinR = Math.sin(rotation);
 
@@ -477,7 +481,22 @@
       var px = Math.round(center.x + rx * scale);
       var py = Math.round(center.y + ry * scale);
 
-      var raw = samplePoint(imageData, width, px, py, sampleRadius);
+      // Peak-seeking: search a small grid around the expected position
+      // and pick the brightest sample (dot centers are always brighter
+      // than the dark background, so the brightest point = closest to
+      // the actual dot center).
+      var raw = { r: 0, g: 0, b: 0 };
+      var bestBrightness = 0;
+      for (var sy = -searchRadius; sy <= searchRadius; sy += searchStep) {
+        for (var sx = -searchRadius; sx <= searchRadius; sx += searchStep) {
+          var c = samplePoint(imageData, width, px + sx, py + sy, sampleRadius);
+          var brightness = c.r + c.g + c.b;
+          if (brightness > bestBrightness) {
+            bestBrightness = brightness;
+            raw = c;
+          }
+        }
+      }
 
       // Apply white-balance correction
       var cr = Math.min(255, Math.round(raw.r * wbGain.r));
