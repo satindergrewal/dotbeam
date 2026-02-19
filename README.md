@@ -83,6 +83,25 @@ Existing visual data transfer (QR codes) is ugly, static, and limited to ~3KB. d
 - **Capacity** — A single QR code maxes out at ~3KB. dotbeam streams data across animated frames using fountain codes — any captured frame is useful, and there's no theoretical size limit.
 - **No network dependency** — WiFi, Bluetooth, NFC, and AirDrop all require network stacks, pairing, or proximity protocols. dotbeam needs only photons — a screen and a camera.
 
+## Why Not QR Codes?
+
+QR codes solved visual data transfer in 1994. They were designed for Toyota factory scanners — fast, reliable, machine-readable. But they were never designed to be shown to humans on screens, and they've barely evolved since.
+
+|  | QR Code | dotbeam |
+|--|---------|---------|
+| **Max payload** | ~3 KB (version 40) | Unlimited (fountain-coded stream) |
+| **Visual** | Black-and-white pixel grid | Colored constellation with glow and animation |
+| **Transfer mode** | Single static image | Animated frames — any frame is useful |
+| **Frame sync** | Must capture the entire code | No ordering, no sync — fountain codes handle it |
+| **Error correction** | Reed-Solomon (built into the single image) | Redundancy across frames + per-dot majority voting |
+| **Aesthetic** | Designed for machines | Designed for humans — meant to be beautiful on screen |
+| **Color use** | Monochrome (some extensions exist) | 8-color palette, 3 bits per dot |
+| **Orientation** | 3 finder patterns (squares in corners) | 3 anchor dots (equilateral triangle, blends in) |
+| **Dependencies** | Typically requires a library (zxing, quirc, etc.) | Zero dependencies — pure Go + vanilla JS |
+| **UX** | Point, snap, done | Point, watch the constellation flow, done |
+
+QR codes are great for what they are. dotbeam is for when the transfer is part of the experience — pairing screens, sharing keys in person, or any moment where "point your camera at this ugly square" isn't good enough.
+
 ## Features
 
 | Feature | Description |
