@@ -699,6 +699,7 @@
     return {
       complete: this._received >= this._totalFrames,
       progress: this.progress(),
+      received: this._received,
     };
   };
 
@@ -756,6 +757,16 @@
     return str;
   };
 
+  /**
+   * Count contiguous frames starting from index 0 (no gaps).
+   * If we have frames 0,1,2 but not 3, returns 3.
+   */
+  Decoder.prototype.contiguousFrames = function () {
+    var count = 0;
+    while (this._frames[count]) count++;
+    return count;
+  };
+
   /** Reset the decoder for a new scan. */
   Decoder.prototype.reset = function () {
     this._votes = {};
@@ -805,6 +816,8 @@
     this._cachedTransform = null;  // last known-good transform
     this._goodFrameCount = 0;     // consecutive good frames with this transform
     this._badHeaderStreak = 0;    // consecutive bad headers (for stale eviction)
+    this._lastNewFrameTime = 0;   // timestamp when last NEW frame was received
+    this._stallTimeoutMs = 8000;  // declare done if no new frames for 8 seconds
 
     // Debug state (always collected; drawn when debug=true in URL)
     this._debug = /[?&]debug/.test(window.location.search);
@@ -1047,16 +1060,38 @@
 
     // Only feed valid frames to the decoder (skip garbage)
     if (headerValid) {
+      var prevRecv = this._decoder._received;
       var result = this._decoder.addFrame(dotValues);
       this._dbgStatus = "decoded";
       this._goodFrameCount++;
       this._badHeaderStreak = 0; // reset streak on good header
 
+      // Track when we last received a NEW frame (for stall detection)
+      if (this._decoder._received > prevRecv) {
+        this._lastNewFrameTime = performance.now();
+      }
+
       if (this._onProgress) {
         this._onProgress(result.progress);
       }
 
-      if (result.complete) {
+      var isDone = result.complete;
+
+      // Stall detection: if we have contiguous frames from 0 but
+      // no new frames for stallTimeoutMs, the totalFrames is probably
+      // wrong — assemble what we have and declare done.
+      if (!isDone && this._lastNewFrameTime > 0 && this._decoder._received >= 1) {
+        var stallElapsed = performance.now() - this._lastNewFrameTime;
+        if (stallElapsed > this._stallTimeoutMs) {
+          var contig = this._decoder.contiguousFrames();
+          if (contig >= 1) {
+            isDone = true;
+            this._dbgStatus = "stall-complete (" + contig + "/" + this._decoder._totalFrames + ")";
+          }
+        }
+      }
+
+      if (isDone) {
         this._running = false;
         if (this._onComplete) {
           this._onComplete(this._decoder.getText());
