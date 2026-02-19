@@ -656,6 +656,8 @@
     this._dbgStatus = "waiting";   // waiting | no-blobs | no-triangle | sampling | decoded
     this._dbgWB = null;            // white-balance gain info
     this._dbgDotRgb = null;        // raw+corrected RGB for first 6 dots
+    this._dbgD0Pos = null;         // {vx, vy} d0 sample position in video coords
+    this._dbgCenterSample = null;  // {r,g,b} raw color at pattern center (should be dark)
   }
 
   /** Register a progress callback: function(progress: 0-1) */
@@ -696,6 +698,20 @@
         self._video.srcObject = stream;
         self._video.setAttribute("playsinline", "true");
         self._video.play();
+
+        // Try to reduce camera exposure to prevent dot overexposure.
+        // Bright dots on dark background cause auto-exposure to over-brighten.
+        var track = stream.getVideoTracks()[0];
+        if (track && track.getCapabilities) {
+          var caps = track.getCapabilities();
+          if (caps.exposureCompensation) {
+            var minEC = caps.exposureCompensation.min;
+            // Pull exposure down by 1-2 stops
+            var targetEC = Math.max(minEC, -2.0);
+            track.applyConstraints({ advanced: [{ exposureCompensation: targetEC }] })
+              .catch(function () { /* ignore — not all devices support this */ });
+          }
+        }
 
         // Wait for video to be ready
         self._video.addEventListener("loadedmetadata", function onMeta() {
@@ -784,10 +800,18 @@
 
     this._dbgStatus = "sampling";
 
+    // Sample the pattern center — should be dark background.
+    // This validates that our coordinate mapping reaches the right area.
+    var sampleR = Math.max(2, Math.floor(transform.scale * 0.025));
+    this._dbgCenterSample = samplePoint(
+      imageData, vw,
+      Math.round(transform.center.x), Math.round(transform.center.y),
+      sampleR
+    );
+
     // White-balance calibration from anchor dots.
     // The anchors are known white — comparing expected vs actual reveals
     // the camera's per-channel colour shift.
-    var sampleR = Math.max(2, Math.floor(transform.scale * 0.025));
     var wbGain = calibrateWhiteBalance(
       imageData, vw, transform.anchors, sampleR
     );
@@ -819,6 +843,10 @@
         vy: transform.center.y + ry * transform.scale,
         colorIdx: dotValues[di2],
       });
+    }
+    // Track d0 position for the prominent debug marker
+    if (this._dbgDotPositions.length > 0) {
+      this._dbgD0Pos = this._dbgDotPositions[0];
     }
 
     // Feed to decoder
@@ -949,6 +977,13 @@
         "rot: " + (this._dbgTransform.rotation * 180 / Math.PI).toFixed(1) + "°"
       );
     }
+    if (this._dbgCenterSample) {
+      debugLines.push(
+        "ctr: " + this._dbgCenterSample.r + "," +
+        this._dbgCenterSample.g + "," + this._dbgCenterSample.b +
+        " (expect dark)"
+      );
+    }
     if (this._dbgWB) {
       debugLines.push(
         "wb: " + this._dbgWB.rawR + "," +
@@ -1040,6 +1075,31 @@
         ctx.arc(dsp.x, dsp.y, 4, 0, 2 * Math.PI);
         ctx.fill();
       }
+    }
+
+    // Draw a PROMINENT marker at d0's position (should always be Red for
+    // small messages — verifies our coordinate mapping is correct)
+    if (this._dbgD0Pos) {
+      var d0sp = self._videoToScreen(this._dbgD0Pos.vx, this._dbgD0Pos.vy);
+      // Large green ring
+      ctx.strokeStyle = "rgba(0,255,0,1)";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(d0sp.x, d0sp.y, 18, 0, 2 * Math.PI);
+      ctx.stroke();
+      // Crosshair
+      ctx.beginPath();
+      ctx.moveTo(d0sp.x - 24, d0sp.y);
+      ctx.lineTo(d0sp.x + 24, d0sp.y);
+      ctx.moveTo(d0sp.x, d0sp.y - 24);
+      ctx.lineTo(d0sp.x, d0sp.y + 24);
+      ctx.stroke();
+      // Label
+      ctx.fillStyle = "rgba(0,255,0,1)";
+      ctx.font = "bold 13px monospace";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "top";
+      ctx.fillText("d0", d0sp.x + 22, d0sp.y - 18);
     }
   };
 

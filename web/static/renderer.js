@@ -6,12 +6,12 @@
   "use strict";
 
   var BG_COLOR = "#0a0a1a";
-  var DATA_DOT_RADIUS_FACTOR = 0.035; // relative to canvas half-size
-  var ANCHOR_DOT_RADIUS_FACTOR = 0.052; // 1.5x data dot
-  var RING_GUIDE_OPACITY = 0.08;
-  var TRANSITION_MS = 150; // color transition duration
+  var DATA_DOT_RADIUS_FACTOR = 0.042; // relative to canvas half-size (larger for camera readability)
+  var ANCHOR_DOT_RADIUS_FACTOR = 0.055; // 1.3x data dot
+  var RING_GUIDE_OPACITY = 0.06;
+  var TRANSITION_MS = 80; // color transition duration (shorter = more stable-frame time for scanner)
   var BREATHING_PERIOD_MS = 3000; // full sine cycle for breathing
-  var BREATHING_AMPLITUDE = 0.05; // 5% size variation
+  var BREATHING_AMPLITUDE = 0.03; // 3% size variation (reduced for scanner stability)
 
   // ── Helpers ────────────────────────────────────────────────────────
 
@@ -264,11 +264,12 @@
 
         var radius = dataDotR * breathScale;
 
-        // Glow effect: radial gradient
-        var glowRadius = radius * 3;
+        // Glow effect: radial gradient (subtle — keeps visuals nice but
+        // doesn't overpower the core color for camera-based scanning)
+        var glowRadius = radius * 2;
         var grad = ctx.createRadialGradient(px, py, 0, px, py, glowRadius);
-        grad.addColorStop(0, rgbaString(color, 0.6));
-        grad.addColorStop(0.4, rgbaString(color, 0.15));
+        grad.addColorStop(0, rgbaString(color, 0.25));
+        grad.addColorStop(0.5, rgbaString(color, 0.06));
         grad.addColorStop(1, rgbaString(color, 0));
         ctx.fillStyle = grad;
         ctx.beginPath();
@@ -292,11 +293,11 @@
         var ay = cy + anchor.y * scale;
         var ar = anchorDotR * breathScale;
 
-        // Anchor glow
-        var aGlowR = ar * 3.5;
+        // Anchor glow (subtle)
+        var aGlowR = ar * 2.5;
         var aGrad = ctx.createRadialGradient(ax, ay, 0, ax, ay, aGlowR);
-        aGrad.addColorStop(0, "rgba(255,255,255,0.7)");
-        aGrad.addColorStop(0.3, "rgba(255,255,255,0.2)");
+        aGrad.addColorStop(0, "rgba(255,255,255,0.35)");
+        aGrad.addColorStop(0.4, "rgba(255,255,255,0.08)");
         aGrad.addColorStop(1, "rgba(255,255,255,0)");
         ctx.fillStyle = aGrad;
         ctx.beginPath();
