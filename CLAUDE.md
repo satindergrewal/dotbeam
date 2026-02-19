@@ -89,7 +89,10 @@ dotbeam/
 │       ├── renderer.js      # Canvas animation (the beautiful part)
 │       └── scanner.js       # Camera capture + dot detection
 └── docs/
-    └── PROTOCOL.md          # Protocol specification
+    ├── PROTOCOL.md          # Protocol specification
+    ├── ARCHITECTURE.md      # Technical architecture reference
+    ├── ENGINEERING-LOG.md   # Decision journal (WHY, not just WHAT)
+    └── FAQ.md               # WHY-focused living document
 ```
 
 ## Current State (What's Already Built)
@@ -98,6 +101,9 @@ dotbeam/
 - [x] Git repo initialized, main branch
 - [x] README.md, LICENSE (MIT), .gitignore, .claude/settings.local.json
 - [x] docs/PROTOCOL.md — full protocol spec (layout, colors, frame structure, decoding)
+- [x] docs/ARCHITECTURE.md — technical architecture reference
+- [x] docs/ENGINEERING-LOG.md — comprehensive engineering decision journal
+- [x] docs/FAQ.md — WHY-focused living document
 - [x] dotbeam.go — core types: Config, Frame, Dot, Color, DefaultColors, DefaultConfig()
 - [x] layout.go — NewLayout(), ring positions, anchor positions, ScaleToCanvas()
 - [x] encoder.go — Encoder with Encode(), bytesToDots(), bytesToBits()
