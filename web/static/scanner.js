@@ -401,11 +401,24 @@
     var avgG = sumG / anchors.length;
     var avgB = sumB / anchors.length;
 
-    // Protect against division by zero / very dark anchors
+    // If anchors are too dark (< 150 avg brightness), don't trust WB —
+    // we're likely sampling the wrong blobs or the image is underexposed.
+    // Also clamp gains to 1.5 max to avoid amplifying camera noise.
+    var MAX_GAIN = 1.5;
+    var MIN_ANCHOR_BRIGHTNESS = 150;
+    var avgBright = (avgR + avgG + avgB) / 3;
+
+    var gr = 1, gg = 1, gb = 1;
+    if (avgBright >= MIN_ANCHOR_BRIGHTNESS) {
+      gr = Math.min(MAX_GAIN, avgR > 20 ? 255 / avgR : 1);
+      gg = Math.min(MAX_GAIN, avgG > 20 ? 255 / avgG : 1);
+      gb = Math.min(MAX_GAIN, avgB > 20 ? 255 / avgB : 1);
+    }
+
     return {
-      r: avgR > 20 ? 255 / avgR : 1,
-      g: avgG > 20 ? 255 / avgG : 1,
-      b: avgB > 20 ? 255 / avgB : 1,
+      r: gr,
+      g: gg,
+      b: gb,
       // store raw values for debug display
       rawR: Math.round(avgR),
       rawG: Math.round(avgG),
@@ -799,20 +812,6 @@
         self._video.srcObject = stream;
         self._video.setAttribute("playsinline", "true");
         self._video.play();
-
-        // Try to reduce camera exposure to prevent dot overexposure.
-        // Bright dots on dark background cause auto-exposure to over-brighten.
-        var track = stream.getVideoTracks()[0];
-        if (track && track.getCapabilities) {
-          var caps = track.getCapabilities();
-          if (caps.exposureCompensation) {
-            var minEC = caps.exposureCompensation.min;
-            // Pull exposure down by 1-2 stops
-            var targetEC = Math.max(minEC, -2.0);
-            track.applyConstraints({ advanced: [{ exposureCompensation: targetEC }] })
-              .catch(function () { /* ignore — not all devices support this */ });
-          }
-        }
 
         // Wait for video to be ready
         self._video.addEventListener("loadedmetadata", function onMeta() {
