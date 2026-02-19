@@ -487,8 +487,8 @@
    */
   // Minimum captures per frame before we trust the majority-voted result.
   var MIN_VOTES = 5;
-  // Minimum captures agreeing on totalFrames before we lock it in.
-  var FT_CONSENSUS_MIN = 3;
+  // Total captures to observe before locking totalFrames (plurality winner).
+  var FT_SETTLE_MIN = 10;
 
   function Decoder() {
     this._votes = {};       // frameIndex -> array of dotValues arrays
@@ -496,6 +496,7 @@
     this._totalFrames = null;
     this._received = 0;
     this._ftCounts = {};    // totalFrames value -> count of captures with that value
+    this._ftTotal = 0;      // total captures seen (for settling threshold)
   }
 
   /** Convert an array of palette indices (0-7, 3 bits each) into bytes. */
@@ -568,17 +569,30 @@
     }
 
     // ── totalFrames consensus locking ──────────────────────────────
-    // Instead of resetting on every totalFrames change (which wipes
-    // accumulated votes), we lock totalFrames once enough captures agree.
-    // Captures with a different totalFrames are silently skipped.
+    // Wait for FT_SETTLE_MIN total captures, then lock on the value
+    // with the most votes (plurality winner).  This avoids locking on
+    // garbage header values from the initial noisy captures.
     this._ftCounts[totalFrames] = (this._ftCounts[totalFrames] || 0) + 1;
+    this._ftTotal = (this._ftTotal || 0) + 1;
 
     if (this._totalFrames === null) {
-      // Not locked yet — need FT_CONSENSUS_MIN agreeing captures
-      if (this._ftCounts[totalFrames] < FT_CONSENSUS_MIN) {
+      // Not locked yet — wait for enough total captures, then pick winner
+      if (this._ftTotal < FT_SETTLE_MIN) {
         return { complete: false, progress: 0 };
       }
-      this._totalFrames = totalFrames;
+      // Find the plurality winner
+      var bestFt = null, bestCount = 0;
+      for (var ftKey in this._ftCounts) {
+        if (this._ftCounts[ftKey] > bestCount) {
+          bestCount = this._ftCounts[ftKey];
+          bestFt = parseInt(ftKey);
+        }
+      }
+      // Winner must have at least 30% of votes to be credible
+      if (bestCount < this._ftTotal * 0.3) {
+        return { complete: false, progress: 0 };
+      }
+      this._totalFrames = bestFt;
     }
 
     // Reject captures that disagree with the locked totalFrames
@@ -690,6 +704,7 @@
     this._totalFrames = null;
     this._received = 0;
     this._ftCounts = {};
+    this._ftTotal = 0;
   };
 
   // ── DotbeamScanner ─────────────────────────────────────────────────
