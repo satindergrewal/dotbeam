@@ -531,7 +531,7 @@
    * (8 dots * 3 bits = 24 bits = 3 bytes).
    */
   // Minimum captures per frame before we trust the majority-voted result.
-  var MIN_VOTES = 5;
+  var MIN_VOTES = 15;
   // Total captures to observe before locking totalFrames (plurality winner).
   var FT_SETTLE_MIN = 30;
 
@@ -815,7 +815,7 @@
     this._goodFrameCount = 0;     // consecutive good frames with this transform
     this._badHeaderStreak = 0;    // consecutive bad headers (for stale eviction)
     this._lastNewFrameTime = 0;   // timestamp when last NEW frame was received
-    this._stallTimeoutMs = 8000;  // declare done if no new frames for 8 seconds
+    this._stallTimeoutMs = 15000; // declare done if no new frames for 15 seconds
 
     // Debug state (always collected; drawn when debug=true in URL)
     this._debug = /[?&]debug/.test(window.location.search);
