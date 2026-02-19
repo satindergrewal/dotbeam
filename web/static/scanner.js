@@ -8,7 +8,38 @@
 
   var palette = DotbeamCore.colors;
 
+  // Pre-compute palette hues for fast matching.
+  var paletteHues = [];
+  for (var pi = 0; pi < palette.length; pi++) {
+    paletteHues.push(rgbToHue(palette[pi].r, palette[pi].g, palette[pi].b));
+  }
+
   // ── Helpers ────────────────────────────────────────────────────────
+
+  /** Convert RGB (0-255) to hue in degrees (0-360). Returns -1 if achromatic. */
+  function rgbToHue(r, g, b) {
+    var max = Math.max(r, g, b);
+    var min = Math.min(r, g, b);
+    var delta = max - min;
+    if (delta < 10) return -1; // near-achromatic
+    var hue;
+    if (max === r) {
+      hue = ((g - b) / delta) % 6;
+    } else if (max === g) {
+      hue = (b - r) / delta + 2;
+    } else {
+      hue = (r - g) / delta + 4;
+    }
+    hue *= 60;
+    if (hue < 0) hue += 360;
+    return hue;
+  }
+
+  /** Angular distance between two hues (0-180). */
+  function hueDist(h1, h2) {
+    var d = Math.abs(h1 - h2);
+    return d > 180 ? 360 - d : d;
+  }
 
   /** Euclidean distance squared in RGB space. */
   function colorDistSq(r1, g1, b1, r2, g2, b2) {
@@ -18,18 +49,45 @@
     return dr * dr + dg * dg + db * db;
   }
 
-  /** Return palette index of the nearest color. */
+  /**
+   * Return palette index of the nearest color.
+   * Uses hue-based matching (robust to camera exposure/white-balance shifts)
+   * with RGB fallback for achromatic or very dark samples.
+   */
   function matchColor(r, g, b) {
-    var bestIdx = 0;
-    var bestDist = Infinity;
-    for (var i = 0; i < palette.length; i++) {
-      var d = colorDistSq(r, g, b, palette[i].r, palette[i].g, palette[i].b);
-      if (d < bestDist) {
-        bestDist = d;
-        bestIdx = i;
+    var max = Math.max(r, g, b);
+    var min = Math.min(r, g, b);
+    var sat = max === 0 ? 0 : (max - min) / max;
+
+    // If the sample is saturated enough, match primarily by hue.
+    // Hue is invariant to brightness/contrast changes from the camera.
+    if (sat > 0.15 && max > 30) {
+      var sampleHue = rgbToHue(r, g, b);
+      if (sampleHue >= 0) {
+        var bestIdx = 0;
+        var bestDist = Infinity;
+        for (var i = 0; i < palette.length; i++) {
+          var hd = hueDist(sampleHue, paletteHues[i]);
+          if (hd < bestDist) {
+            bestDist = hd;
+            bestIdx = i;
+          }
+        }
+        return bestIdx;
       }
     }
-    return bestIdx;
+
+    // Fallback: Euclidean RGB distance (for achromatic/dark samples)
+    var bestIdx2 = 0;
+    var bestDist2 = Infinity;
+    for (var j = 0; j < palette.length; j++) {
+      var d = colorDistSq(r, g, b, palette[j].r, palette[j].g, palette[j].b);
+      if (d < bestDist2) {
+        bestDist2 = d;
+        bestIdx2 = j;
+      }
+    }
+    return bestIdx2;
   }
 
   /** Distance between two 2D points. */
@@ -486,6 +544,15 @@
     // Scan timing
     this._lastScanTime = 0;
     this._scanIntervalMs = 100; // scan at ~10 Hz
+
+    // Debug state (always collected; drawn when debug=true in URL)
+    this._debug = /[?&]debug/.test(window.location.search);
+    this._dbgBlobs = null;         // detected blobs
+    this._dbgTransform = null;     // derived transform
+    this._dbgDotPositions = null;  // [{x,y,colorIdx}] in video coords
+    this._dbgHeader = null;        // {frameIndex, totalFrames} from last decode
+    this._dbgBlobCount = 0;
+    this._dbgStatus = "waiting";   // waiting | no-blobs | no-triangle | sampling | decoded
   }
 
   /** Register a progress callback: function(progress: 0-1) */
@@ -591,17 +658,62 @@
 
     // Find white anchor blobs
     var blobs = findWhiteBlobs(imageData, vw, vh);
-    if (blobs.length < 3) return;
+    this._dbgBlobCount = blobs.length;
+    this._dbgBlobs = blobs.slice(0, 8);
+
+    if (blobs.length < 3) {
+      this._dbgStatus = "no-blobs";
+      this._dbgTransform = null;
+      this._dbgDotPositions = null;
+      return;
+    }
 
     // Derive transform from anchors
     var transform = deriveTransform(blobs);
-    if (!transform) return;
+    this._dbgTransform = transform;
 
-    // Sample dot colors
+    if (!transform) {
+      this._dbgStatus = "no-triangle";
+      this._dbgDotPositions = null;
+      return;
+    }
+
+    this._dbgStatus = "sampling";
+
+    // Sample dot colors and store debug positions
     var dotValues = sampleDots(imageData, vw, transform, this._layoutData);
+
+    // Store dot positions for debug overlay
+    var allDots = [];
+    for (var ri = 0; ri < this._layoutData.rings.length; ri++) {
+      var ring = this._layoutData.rings[ri];
+      for (var di = 0; di < ring.dots.length; di++) {
+        allDots.push(ring.dots[di]);
+      }
+    }
+    var cosR = Math.cos(transform.rotation);
+    var sinR = Math.sin(transform.rotation);
+    this._dbgDotPositions = [];
+    for (var di2 = 0; di2 < allDots.length; di2++) {
+      var dot = allDots[di2];
+      var rx = dot.x * cosR - dot.y * sinR;
+      var ry = dot.x * sinR + dot.y * cosR;
+      this._dbgDotPositions.push({
+        vx: transform.center.x + rx * transform.scale,
+        vy: transform.center.y + ry * transform.scale,
+        colorIdx: dotValues[di2],
+      });
+    }
 
     // Feed to decoder
     var result = this._decoder.addFrame(dotValues);
+    this._dbgStatus = "decoded";
+
+    // Store header info
+    var rawBytes = this._decoder._dotsToBytes(dotValues);
+    if (rawBytes.length >= 2) {
+      this._dbgHeader = { frameIndex: rawBytes[0], totalFrames: rawBytes[1] };
+    }
 
     if (this._onProgress) {
       this._onProgress(result.progress);
@@ -613,6 +725,30 @@
         this._onComplete(this._decoder.getText());
       }
     }
+  };
+
+  /**
+   * Map a point from video-pixel coords to overlay-screen coords.
+   * Accounts for object-fit: cover on the video element.
+   */
+  DotbeamScanner.prototype._videoToScreen = function (vx, vy) {
+    var vw = this._video.videoWidth || 1;
+    var vh = this._video.videoHeight || 1;
+    var sw = window.innerWidth;
+    var sh = window.innerHeight;
+    var videoAR = vw / vh;
+    var screenAR = sw / sh;
+    var scale, offsetX, offsetY;
+    if (videoAR > screenAR) {
+      scale = sh / vh;
+      offsetX = (sw - vw * scale) / 2;
+      offsetY = 0;
+    } else {
+      scale = sw / vw;
+      offsetX = 0;
+      offsetY = (sh - vh * scale) / 2;
+    }
+    return { x: vx * scale + offsetX, y: vy * scale + offsetY };
   };
 
   DotbeamScanner.prototype._drawOverlay = function () {
@@ -669,6 +805,93 @@
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(pct + "%", cx, cy + ringRadius + 24);
+
+    // ── Debug overlay (enabled with ?debug in URL) ──────────────────
+    if (!this._debug) return;
+
+    var self = this;
+
+    // Debug status text
+    ctx.fillStyle = "rgba(255,255,0,0.9)";
+    ctx.font = "12px monospace";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+
+    var debugLines = [
+      "status: " + this._dbgStatus,
+      "blobs: " + this._dbgBlobCount,
+    ];
+    if (this._dbgTransform) {
+      debugLines.push(
+        "center: " +
+          Math.round(this._dbgTransform.center.x) +
+          "," +
+          Math.round(this._dbgTransform.center.y)
+      );
+      debugLines.push("scale: " + Math.round(this._dbgTransform.scale));
+      debugLines.push(
+        "rot: " + (this._dbgTransform.rotation * 180 / Math.PI).toFixed(1) + "°"
+      );
+    }
+    if (this._dbgHeader) {
+      debugLines.push(
+        "hdr: frame=" + this._dbgHeader.frameIndex +
+        " total=" + this._dbgHeader.totalFrames
+      );
+    }
+    debugLines.push("recv: " + this._decoder._received);
+
+    for (var li = 0; li < debugLines.length; li++) {
+      ctx.fillText(debugLines[li], 10, 60 + li * 16);
+    }
+
+    // Draw detected blobs as green circles
+    if (this._dbgBlobs) {
+      ctx.strokeStyle = "rgba(0,255,0,0.8)";
+      ctx.lineWidth = 2;
+      for (var bi = 0; bi < this._dbgBlobs.length; bi++) {
+        var blob = this._dbgBlobs[bi];
+        var sp = self._videoToScreen(blob.x, blob.y);
+        var r = Math.max(6, blob.size * 2);
+        ctx.beginPath();
+        ctx.arc(sp.x, sp.y, r, 0, 2 * Math.PI);
+        ctx.stroke();
+        // Label blob index
+        ctx.fillStyle = "rgba(0,255,0,0.8)";
+        ctx.font = "10px monospace";
+        ctx.fillText(bi.toString(), sp.x + r + 2, sp.y - 4);
+      }
+    }
+
+    // Draw center crosshair
+    if (this._dbgTransform) {
+      var cp = self._videoToScreen(
+        this._dbgTransform.center.x,
+        this._dbgTransform.center.y
+      );
+      ctx.strokeStyle = "rgba(255,255,0,0.8)";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(cp.x - 12, cp.y);
+      ctx.lineTo(cp.x + 12, cp.y);
+      ctx.moveTo(cp.x, cp.y - 12);
+      ctx.lineTo(cp.x, cp.y + 12);
+      ctx.stroke();
+    }
+
+    // Draw sample dot positions with their detected colors
+    if (this._dbgDotPositions) {
+      for (var dpi = 0; dpi < this._dbgDotPositions.length; dpi++) {
+        var dp = this._dbgDotPositions[dpi];
+        var dsp = self._videoToScreen(dp.vx, dp.vy);
+        var col = palette[dp.colorIdx];
+        ctx.fillStyle =
+          "rgba(" + col.r + "," + col.g + "," + col.b + ",0.7)";
+        ctx.beginPath();
+        ctx.arc(dsp.x, dsp.y, 4, 0, 2 * Math.PI);
+        ctx.fill();
+      }
+    }
   };
 
   // ── Export ──────────────────────────────────────────────────────────
