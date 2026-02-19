@@ -535,7 +535,7 @@
   // Minimum captures per frame before we trust the majority-voted result.
   var MIN_VOTES = 5;
   // Total captures to observe before locking totalFrames (plurality winner).
-  var FT_SETTLE_MIN = 10;
+  var FT_SETTLE_MIN = 30;
 
   function Decoder() {
     this._votes = {};       // frameIndex -> array of dotValues arrays
@@ -616,30 +616,42 @@
     }
 
     // ── totalFrames consensus locking ──────────────────────────────
-    // Wait for FT_SETTLE_MIN total captures, then lock on the value
-    // with the most votes (plurality winner).  This avoids locking on
-    // garbage header values from the initial noisy captures.
+    // Always count votes.  Lock on the plurality winner after enough
+    // captures.  If a challenger later gets 2× the locked value's
+    // votes, re-lock on the challenger and reset accumulated data.
     this._ftCounts[totalFrames] = (this._ftCounts[totalFrames] || 0) + 1;
     this._ftTotal = (this._ftTotal || 0) + 1;
+
+    // Find current plurality winner
+    var bestFt = null, bestCount = 0;
+    for (var ftKey in this._ftCounts) {
+      if (this._ftCounts[ftKey] > bestCount) {
+        bestCount = this._ftCounts[ftKey];
+        bestFt = parseInt(ftKey);
+      }
+    }
 
     if (this._totalFrames === null) {
       // Not locked yet — wait for enough total captures, then pick winner
       if (this._ftTotal < FT_SETTLE_MIN) {
         return { complete: false, progress: 0 };
       }
-      // Find the plurality winner
-      var bestFt = null, bestCount = 0;
-      for (var ftKey in this._ftCounts) {
-        if (this._ftCounts[ftKey] > bestCount) {
-          bestCount = this._ftCounts[ftKey];
-          bestFt = parseInt(ftKey);
-        }
-      }
-      // Winner must have at least 30% of votes to be credible
-      if (bestCount < this._ftTotal * 0.3) {
+      // Winner must have at least 40% of votes to be credible
+      if (bestCount < this._ftTotal * 0.4) {
         return { complete: false, progress: 0 };
       }
       this._totalFrames = bestFt;
+    } else if (bestFt !== this._totalFrames) {
+      // Already locked — check if challenger has overwhelmed the lock.
+      // Re-lock when challenger has 2× the current lock's vote count.
+      var lockedCount = this._ftCounts[this._totalFrames] || 0;
+      if (bestCount > lockedCount * 2) {
+        this._totalFrames = bestFt;
+        // Reset per-frame votes (indexed by old totalFrames)
+        this._votes = {};
+        this._frames = {};
+        this._received = 0;
+      }
     }
 
     // Reject captures that disagree with the locked totalFrames
