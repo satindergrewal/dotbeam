@@ -6,12 +6,12 @@
   "use strict";
 
   var BG_COLOR = "#0a0a1a";
-  var DATA_DOT_RADIUS_FACTOR = 0.042; // relative to canvas half-size (larger for camera readability)
-  var ANCHOR_DOT_RADIUS_FACTOR = 0.055; // 1.3x data dot
-  var RING_GUIDE_OPACITY = 0.06;
-  var TRANSITION_MS = 80; // color transition duration (shorter = more stable-frame time for scanner)
-  var BREATHING_PERIOD_MS = 3000; // full sine cycle for breathing
-  var BREATHING_AMPLITUDE = 0.03; // 3% size variation (reduced for scanner stability)
+  var DATA_DOT_RADIUS_FACTOR = 0.06; // relative to canvas half-size (large for camera readability)
+  var ANCHOR_DOT_RADIUS_FACTOR = 0.065; // slightly larger than data dots
+  var RING_GUIDE_OPACITY = 0.04;
+  var TRANSITION_MS = 0; // instant frame changes (no blending = clean colors for scanner)
+  var BREATHING_PERIOD_MS = 3000;
+  var BREATHING_AMPLITUDE = 0; // disabled (constant size for scanner stability)
 
   // ── Helpers ────────────────────────────────────────────────────────
 
@@ -264,19 +264,7 @@
 
         var radius = dataDotR * breathScale;
 
-        // Glow effect: radial gradient (subtle — keeps visuals nice but
-        // doesn't overpower the core color for camera-based scanning)
-        var glowRadius = radius * 2;
-        var grad = ctx.createRadialGradient(px, py, 0, px, py, glowRadius);
-        grad.addColorStop(0, rgbaString(color, 0.25));
-        grad.addColorStop(0.5, rgbaString(color, 0.06));
-        grad.addColorStop(1, rgbaString(color, 0));
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.arc(px, py, glowRadius, 0, 2 * Math.PI);
-        ctx.fill();
-
-        // Core dot
+        // Solid core dot only (no glow — cleaner for camera-based scanning)
         ctx.fillStyle = rgbString(color);
         ctx.beginPath();
         ctx.arc(px, py, radius, 0, 2 * Math.PI);
@@ -293,18 +281,7 @@
         var ay = cy + anchor.y * scale;
         var ar = anchorDotR * breathScale;
 
-        // Anchor glow (subtle)
-        var aGlowR = ar * 2.5;
-        var aGrad = ctx.createRadialGradient(ax, ay, 0, ax, ay, aGlowR);
-        aGrad.addColorStop(0, "rgba(255,255,255,0.35)");
-        aGrad.addColorStop(0.4, "rgba(255,255,255,0.08)");
-        aGrad.addColorStop(1, "rgba(255,255,255,0)");
-        ctx.fillStyle = aGrad;
-        ctx.beginPath();
-        ctx.arc(ax, ay, aGlowR, 0, 2 * Math.PI);
-        ctx.fill();
-
-        // Anchor core
+        // Anchor core (solid white, no glow — must be detectable as white blob)
         ctx.fillStyle = rgbString(white);
         ctx.beginPath();
         ctx.arc(ax, ay, ar, 0, 2 * Math.PI);

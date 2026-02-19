@@ -462,7 +462,7 @@
       }
     }
 
-    var sampleRadius = Math.max(2, Math.floor(scale * 0.025));
+    var sampleRadius = Math.max(2, Math.floor(scale * 0.038));
     var cosR = Math.cos(rotation);
     var sinR = Math.sin(rotation);
 
@@ -954,7 +954,7 @@
     this._dbgStatus = "sampling";
 
     // Sample the pattern center — should be dark background.
-    var sampleR = Math.max(2, Math.floor(transform.scale * 0.025));
+    var sampleR = Math.max(2, Math.floor(transform.scale * 0.038));
     this._dbgCenterSample = samplePoint(
       imageData, vw,
       Math.round(transform.center.x), Math.round(transform.center.y),
