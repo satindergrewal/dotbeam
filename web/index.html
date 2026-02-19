@@ -88,6 +88,20 @@
             color: rgba(255, 255, 255, 0.19);
         }
 
+        .scan-link {
+            font-size: 12px;
+            color: rgba(255, 255, 255, 0.25);
+            text-decoration: none;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+            padding-bottom: 1px;
+            transition: color 0.2s;
+            margin-top: 4px;
+        }
+
+        .scan-link:hover {
+            color: rgba(255, 255, 255, 0.5);
+        }
+
         .error-message {
             font-size: 14px;
             font-weight: 400;
@@ -126,6 +140,7 @@
         <div class="info">
             <div class="transmitting" id="transmitting-label"></div>
             <div class="hint" id="hint-label">Point your camera at this screen to receive</div>
+            <a href="/scan.html" class="scan-link">Open scanner on this device</a>
         </div>
     </div>
 
