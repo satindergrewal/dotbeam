@@ -60,8 +60,9 @@
    */
   function findWhiteBlobs(imageData, width, height) {
     var data = imageData.data;
-    // Threshold: all channels > 200
-    var THRESHOLD = 200;
+    // Threshold: all channels must exceed this to count as "white".
+    // Lower than 255 to account for camera exposure, gamma, and screen glare.
+    var THRESHOLD = 160;
     var CELL_SIZE = 8; // grid cell size for clustering
 
     var gridW = Math.ceil(width / CELL_SIZE);
@@ -166,19 +167,33 @@
    * Given 3 anchor points (detected blobs), determine the rotation and
    * scale of the dotbeam pattern.
    *
-   * The anchors are at known angles (270deg, 30deg, 150deg) at radius
-   * 0.82 in the pattern's coordinate system.
+   * In screen coordinates (with -sin for Y), the anchors sit at:
+   *   270deg anchor → (0, +0.82)   → bottom-center
+   *   30deg anchor  → (+0.71, -0.41) → top-right
+   *   150deg anchor → (-0.71, -0.41) → top-left
+   *
+   * The bottommost blob (largest screen Y) is the 270deg anchor.
    *
    * Returns { center, scale, rotation } or null if detection failed.
    */
   function deriveTransform(blobs) {
     if (blobs.length < 3) return null;
 
-    // Take the 3 largest blobs
-    var candidates = blobs.slice(0, 3);
-    if (!isEquilateralTriangle(candidates[0], candidates[1], candidates[2])) {
-      return null;
+    // Try the 3 largest blobs first; fall back to other triples if needed.
+    var candidates = null;
+    var limit = Math.min(blobs.length, 6); // check up to 6 largest blobs
+    outer:
+    for (var i = 0; i < limit - 2; i++) {
+      for (var j = i + 1; j < limit - 1; j++) {
+        for (var k = j + 1; k < limit; k++) {
+          if (isEquilateralTriangle(blobs[i], blobs[j], blobs[k])) {
+            candidates = [blobs[i], blobs[j], blobs[k]];
+            break outer;
+          }
+        }
+      }
     }
+    if (!candidates) return null;
 
     // Center is the centroid of the triangle
     var center = centroid(candidates);
@@ -186,33 +201,34 @@
     // Average distance from center to anchors is the pixel radius
     // corresponding to the pattern anchor radius of 0.82
     var avgDist = 0;
-    for (var i = 0; i < 3; i++) {
-      avgDist += dist(center, candidates[i]);
+    for (var i2 = 0; i2 < 3; i2++) {
+      avgDist += dist(center, candidates[i2]);
     }
     avgDist /= 3;
 
     var scale = avgDist / DotbeamCore.ANCHOR_RADIUS;
 
-    // Determine rotation: the anchor at 270deg (top, in math coords that
-    // is straight up / -Y in screen coords) should be the topmost blob.
-    // Find the anchor with the smallest Y (topmost in screen coords).
-    var topIdx = 0;
-    for (var j = 1; j < 3; j++) {
-      if (candidates[j].y < candidates[topIdx].y) {
-        topIdx = j;
+    // The 270deg anchor is the bottommost blob (largest Y in screen coords).
+    var bottomIdx = 0;
+    for (var m = 1; m < 3; m++) {
+      if (candidates[m].y > candidates[bottomIdx].y) {
+        bottomIdx = m;
       }
     }
 
-    // The top anchor corresponds to 270deg in pattern space.
-    // Compute the actual angle from center to the detected top blob.
-    var topBlob = candidates[topIdx];
+    // Compute actual angle from center to the bottom blob in camera coords.
+    var bottomBlob = candidates[bottomIdx];
     var detectedAngle = Math.atan2(
-      topBlob.y - center.y,
-      topBlob.x - center.x
+      bottomBlob.y - center.y,
+      bottomBlob.x - center.x
     );
-    // Expected angle for the 270deg anchor: 270deg = -PI/2 = 3PI/2
-    var expectedAngle = (270 * Math.PI) / 180;
+    // In screen coords, the 270deg anchor is at (0, +0.82) → angle PI/2
+    var expectedAngle = Math.PI / 2;
     var rotation = detectedAngle - expectedAngle;
+
+    // Normalize to [-PI, PI]
+    while (rotation > Math.PI) rotation -= 2 * Math.PI;
+    while (rotation < -Math.PI) rotation += 2 * Math.PI;
 
     return {
       center: center,
@@ -242,28 +258,33 @@
     }
 
     var results = [];
-    var sampleRadius = Math.max(1, Math.floor(scale * 0.015));
+    // Larger sample area to capture the dot core through camera blur.
+    var sampleRadius = Math.max(2, Math.floor(scale * 0.025));
+
+    // Pre-compute rotation matrix once (constant for all dots in a frame).
+    var cosR = Math.cos(rotation);
+    var sinR = Math.sin(rotation);
 
     for (var i = 0; i < allDots.length; i++) {
       var dot = allDots[i];
 
       // Transform pattern coordinates to pixel coordinates.
-      // Apply rotation then scale and translate.
-      var cosR = Math.cos(rotation);
-      var sinR = Math.sin(rotation);
       var rx = dot.x * cosR - dot.y * sinR;
       var ry = dot.x * sinR + dot.y * cosR;
       var px = Math.round(center.x + rx * scale);
       var py = Math.round(center.y + ry * scale);
 
-      // Sample a small area around the dot center and average
+      // Sample a small area around the dot center and average.
+      // Use only pixels within the circular sample area (not a square).
       var totalR = 0,
         totalG = 0,
         totalB = 0,
         count = 0;
+      var sr2 = sampleRadius * sampleRadius;
 
       for (var sy = -sampleRadius; sy <= sampleRadius; sy++) {
         for (var sx = -sampleRadius; sx <= sampleRadius; sx++) {
+          if (sx * sx + sy * sy > sr2) continue; // circular sampling
           var spx = px + sx;
           var spy = py + sy;
           if (spx >= 0 && spx < width && spy >= 0 && spy < imageData.height) {
@@ -347,8 +368,19 @@
     var frameIndex = rawBytes[0];
     var totalFrames = rawBytes[1];
 
-    if (totalFrames === 0) {
-      return { complete: false, progress: 0 };
+    // Sanity checks: reject clearly invalid headers
+    if (totalFrames === 0 || totalFrames > 200) {
+      return { complete: false, progress: this.progress() };
+    }
+    if (frameIndex >= totalFrames) {
+      return { complete: false, progress: this.progress() };
+    }
+
+    // If totalFrames changes from what we've been tracking, the previous
+    // readings were likely noise — reset and start fresh.
+    if (this._totalFrames !== null && totalFrames !== this._totalFrames) {
+      this._frames = {};
+      this._received = 0;
     }
 
     this._totalFrames = totalFrames;
