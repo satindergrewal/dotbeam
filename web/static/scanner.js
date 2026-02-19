@@ -111,23 +111,30 @@
   // ── Blob detection for anchors ─────────────────────────────────────
 
   /**
-   * Simple bright-white blob finder.
-   * Scans the image data looking for clusters of very bright pixels (close
-   * to white). Returns an array of {x, y, size} blobs sorted by size
-   * descending.
+   * Two-pass bright-white blob finder with saturation filtering.
+   *
+   * Pass 1: grid-based flood fill to find bright blobs.
+   * Pass 2: for each blob centroid, verify the centre is actually WHITE
+   *         (low saturation) — not just a bright coloured area that happens
+   *         to have all channels above threshold through the camera.
+   *
+   * Returns an array of {x, y, size} blobs sorted by size descending.
+   * Large blobs (likely screen glare) are capped / discarded.
    */
   function findWhiteBlobs(imageData, width, height) {
     var data = imageData.data;
-    // Threshold: all channels must exceed this to count as "white".
-    // Lower than 255 to account for camera exposure, gamma, and screen glare.
-    var THRESHOLD = 160;
-    var CELL_SIZE = 8; // grid cell size for clustering
+    var THRESHOLD = 180; // raised — 160 was too permissive
+    var CELL_SIZE = 8;
+
+    // Maximum blob size in grid cells.  A real anchor dot at typical viewing
+    // distance produces ≤ 30 cells.  Blobs bigger than this are screen glare.
+    var MAX_BLOB_CELLS = 60;
 
     var gridW = Math.ceil(width / CELL_SIZE);
     var gridH = Math.ceil(height / CELL_SIZE);
     var grid = new Uint8Array(gridW * gridH);
 
-    // Mark grid cells that contain bright-white pixels
+    // Mark grid cells that contain bright pixels (all channels > threshold)
     for (var y = 0; y < height; y += 2) {
       for (var x = 0; x < width; x += 2) {
         var idx = (y * width + x) * 4;
@@ -150,23 +157,21 @@
       for (var gx2 = 0; gx2 < gridW; gx2++) {
         var gi = gy2 * gridW + gx2;
         if (grid[gi] && !visited[gi]) {
-          // BFS flood fill
           var queue = [gi];
           visited[gi] = 1;
           var cells = [];
 
           while (queue.length > 0) {
             var ci = queue.shift();
-            var cx = ci % gridW;
-            var cy = Math.floor(ci / gridW);
-            cells.push({ x: cx, y: cy });
+            var cx2 = ci % gridW;
+            var cy2 = Math.floor(ci / gridW);
+            cells.push({ x: cx2, y: cy2 });
 
-            // 4-connected neighbors
             var neighbors = [
-              cy > 0 ? (cy - 1) * gridW + cx : -1,
-              cy < gridH - 1 ? (cy + 1) * gridW + cx : -1,
-              cx > 0 ? cy * gridW + (cx - 1) : -1,
-              cx < gridW - 1 ? cy * gridW + (cx + 1) : -1,
+              cy2 > 0 ? (cy2 - 1) * gridW + cx2 : -1,
+              cy2 < gridH - 1 ? (cy2 + 1) * gridW + cx2 : -1,
+              cx2 > 0 ? cy2 * gridW + (cx2 - 1) : -1,
+              cx2 < gridW - 1 ? cy2 * gridW + (cx2 + 1) : -1,
             ];
             for (var ni = 0; ni < neighbors.length; ni++) {
               var n = neighbors[ni];
@@ -177,20 +182,47 @@
             }
           }
 
-          // Blob centroid in pixel coords
-          if (cells.length >= 2) {
-            var bx = 0,
-              by = 0;
-            for (var ci2 = 0; ci2 < cells.length; ci2++) {
-              bx += cells[ci2].x * CELL_SIZE + CELL_SIZE / 2;
-              by += cells[ci2].y * CELL_SIZE + CELL_SIZE / 2;
-            }
-            blobs.push({
-              x: bx / cells.length,
-              y: by / cells.length,
-              size: cells.length,
-            });
+          // Reject blobs that are too small or too large
+          if (cells.length < 2 || cells.length > MAX_BLOB_CELLS) continue;
+
+          var bx = 0,
+            by = 0;
+          for (var ci2 = 0; ci2 < cells.length; ci2++) {
+            bx += cells[ci2].x * CELL_SIZE + CELL_SIZE / 2;
+            by += cells[ci2].y * CELL_SIZE + CELL_SIZE / 2;
           }
+          var centX = bx / cells.length;
+          var centY = by / cells.length;
+
+          // Verify the blob centre is actually WHITE (low saturation).
+          // Sample a 5×5 patch at the centroid and check average saturation.
+          var pcx = Math.round(centX);
+          var pcy = Math.round(centY);
+          var sumR = 0, sumG = 0, sumB = 0, cnt = 0;
+          for (var py2 = pcy - 2; py2 <= pcy + 2; py2++) {
+            for (var px2 = pcx - 2; px2 <= pcx + 2; px2++) {
+              if (px2 >= 0 && px2 < width && py2 >= 0 && py2 < height) {
+                var pi2 = (py2 * width + px2) * 4;
+                sumR += data[pi2];
+                sumG += data[pi2 + 1];
+                sumB += data[pi2 + 2];
+                cnt++;
+              }
+            }
+          }
+          if (cnt > 0) {
+            var avgR = sumR / cnt;
+            var avgG = sumG / cnt;
+            var avgB = sumB / cnt;
+            var cMax = Math.max(avgR, avgG, avgB);
+            var cMin = Math.min(avgR, avgG, avgB);
+            var cSat = cMax > 0 ? (cMax - cMin) / cMax : 0;
+            // Reject blobs whose centre is too colourful (> 25% saturation).
+            // Actual white dots through a camera have saturation < 0.15.
+            if (cSat > 0.25) continue;
+          }
+
+          blobs.push({ x: centX, y: centY, size: cells.length });
         }
       }
     }
@@ -204,21 +236,34 @@
   }
 
   /**
-   * Given 3 blobs, verify they form an approximately equilateral triangle.
+   * Given 3 blobs, verify they form an approximately equilateral triangle
+   * AND have roughly similar sizes (all three are the same kind of dot).
    * Returns true if the side lengths are within 30% of each other.
    */
   function isEquilateralTriangle(a, b, c) {
+    // Side lengths
     var d1 = dist(a, b);
     var d2 = dist(b, c);
     var d3 = dist(a, c);
     var avg = (d1 + d2 + d3) / 3;
-    if (avg < 10) return false; // too small
+    if (avg < 20) return false; // too small (raised from 10)
     var tolerance = 0.3;
-    return (
-      Math.abs(d1 - avg) / avg < tolerance &&
-      Math.abs(d2 - avg) / avg < tolerance &&
-      Math.abs(d3 - avg) / avg < tolerance
-    );
+    if (
+      Math.abs(d1 - avg) / avg >= tolerance ||
+      Math.abs(d2 - avg) / avg >= tolerance ||
+      Math.abs(d3 - avg) / avg >= tolerance
+    ) {
+      return false;
+    }
+
+    // Blob sizes should be in the same ballpark (within 3× of each other).
+    // This rejects triples where a huge glare blob is mixed with real anchors.
+    var sizes = [a.size, b.size, c.size];
+    var minSize = Math.min(sizes[0], sizes[1], sizes[2]);
+    var maxSize = Math.max(sizes[0], sizes[1], sizes[2]);
+    if (maxSize > minSize * 3) return false;
+
+    return true;
   }
 
   /**
@@ -237,9 +282,9 @@
   function deriveTransform(blobs) {
     if (blobs.length < 3) return null;
 
-    // Try the 3 largest blobs first; fall back to other triples if needed.
+    // Search all filtered blobs (up to 10) for an equilateral triple.
     var candidates = null;
-    var limit = Math.min(blobs.length, 6); // check up to 6 largest blobs
+    var limit = Math.min(blobs.length, 10);
     outer:
     for (var i = 0; i < limit - 2; i++) {
       for (var j = i + 1; j < limit - 1; j++) {
@@ -292,6 +337,7 @@
       center: center,
       scale: scale,
       rotation: rotation,
+      anchors: candidates, // the 3 blobs chosen as anchors
     };
   }
 
@@ -547,7 +593,8 @@
 
     // Debug state (always collected; drawn when debug=true in URL)
     this._debug = /[?&]debug/.test(window.location.search);
-    this._dbgBlobs = null;         // detected blobs
+    this._dbgBlobs = null;         // detected blobs (all)
+    this._dbgAnchors = null;       // the 3 selected anchor blobs
     this._dbgTransform = null;     // derived transform
     this._dbgDotPositions = null;  // [{x,y,colorIdx}] in video coords
     this._dbgHeader = null;        // {frameIndex, totalFrames} from last decode
@@ -671,6 +718,7 @@
     // Derive transform from anchors
     var transform = deriveTransform(blobs);
     this._dbgTransform = transform;
+    this._dbgAnchors = transform ? transform.anchors : null;
 
     if (!transform) {
       this._dbgStatus = "no-triangle";
@@ -845,37 +893,49 @@
       ctx.fillText(debugLines[li], 10, 60 + li * 16);
     }
 
-    // Draw detected blobs as green circles
+    // Draw all detected blobs as small green circles
     if (this._dbgBlobs) {
-      ctx.strokeStyle = "rgba(0,255,0,0.8)";
-      ctx.lineWidth = 2;
+      ctx.strokeStyle = "rgba(0,255,0,0.5)";
+      ctx.lineWidth = 1;
       for (var bi = 0; bi < this._dbgBlobs.length; bi++) {
         var blob = this._dbgBlobs[bi];
         var sp = self._videoToScreen(blob.x, blob.y);
-        var r = Math.max(6, blob.size * 2);
         ctx.beginPath();
-        ctx.arc(sp.x, sp.y, r, 0, 2 * Math.PI);
+        ctx.arc(sp.x, sp.y, 5, 0, 2 * Math.PI);
         ctx.stroke();
-        // Label blob index
-        ctx.fillStyle = "rgba(0,255,0,0.8)";
-        ctx.font = "10px monospace";
-        ctx.fillText(bi.toString(), sp.x + r + 2, sp.y - 4);
       }
     }
 
-    // Draw center crosshair
+    // Draw the 3 selected anchors as large RED circles (distinct from blobs)
+    if (this._dbgAnchors) {
+      ctx.strokeStyle = "rgba(255,50,50,1)";
+      ctx.lineWidth = 3;
+      for (var ai = 0; ai < this._dbgAnchors.length; ai++) {
+        var anc = this._dbgAnchors[ai];
+        var asp = self._videoToScreen(anc.x, anc.y);
+        ctx.beginPath();
+        ctx.arc(asp.x, asp.y, 14, 0, 2 * Math.PI);
+        ctx.stroke();
+        // Label: A0 A1 A2
+        ctx.fillStyle = "rgba(255,50,50,1)";
+        ctx.font = "11px monospace";
+        ctx.fillText("A" + ai, asp.x + 16, asp.y - 6);
+      }
+    }
+
+    // Draw center crosshair (yellow)
     if (this._dbgTransform) {
       var cp = self._videoToScreen(
         this._dbgTransform.center.x,
         this._dbgTransform.center.y
       );
-      ctx.strokeStyle = "rgba(255,255,0,0.8)";
-      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "rgba(255,255,0,0.9)";
+      ctx.lineWidth = 2;
       ctx.beginPath();
-      ctx.moveTo(cp.x - 12, cp.y);
-      ctx.lineTo(cp.x + 12, cp.y);
-      ctx.moveTo(cp.x, cp.y - 12);
-      ctx.lineTo(cp.x, cp.y + 12);
+      ctx.moveTo(cp.x - 14, cp.y);
+      ctx.lineTo(cp.x + 14, cp.y);
+      ctx.moveTo(cp.x, cp.y - 14);
+      ctx.lineTo(cp.x, cp.y + 14);
       ctx.stroke();
     }
 
@@ -886,7 +946,7 @@
         var dsp = self._videoToScreen(dp.vx, dp.vy);
         var col = palette[dp.colorIdx];
         ctx.fillStyle =
-          "rgba(" + col.r + "," + col.g + "," + col.b + ",0.7)";
+          "rgba(" + col.r + "," + col.g + "," + col.b + ",0.8)";
         ctx.beginPath();
         ctx.arc(dsp.x, dsp.y, 4, 0, 2 * Math.PI);
         ctx.fill();
