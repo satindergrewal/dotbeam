@@ -344,11 +344,84 @@
   // ── Dot sampling ───────────────────────────────────────────────────
 
   /**
-   * Given a transform and layout, sample pixel colors at each dot
-   * position and return an array of palette indices.
+   * Sample the colour at a single point using a circular averaging patch.
+   * Returns {r, g, b} in 0-255.
    */
-  function sampleDots(imageData, width, transform, layoutData) {
+  function samplePoint(imageData, width, px, py, sampleRadius) {
     var data = imageData.data;
+    var sr2 = sampleRadius * sampleRadius;
+    var totalR = 0, totalG = 0, totalB = 0, count = 0;
+
+    for (var sy = -sampleRadius; sy <= sampleRadius; sy++) {
+      for (var sx = -sampleRadius; sx <= sampleRadius; sx++) {
+        if (sx * sx + sy * sy > sr2) continue;
+        var spx = px + sx;
+        var spy = py + sy;
+        if (spx >= 0 && spx < width && spy >= 0 && spy < imageData.height) {
+          var idx = (spy * width + spx) * 4;
+          totalR += data[idx];
+          totalG += data[idx + 1];
+          totalB += data[idx + 2];
+          count++;
+        }
+      }
+    }
+
+    if (count === 0) return { r: 0, g: 0, b: 0 };
+    return {
+      r: Math.round(totalR / count),
+      g: Math.round(totalG / count),
+      b: Math.round(totalB / count),
+    };
+  }
+
+  /**
+   * Derive per-channel white-balance gain from the detected anchor dots.
+   * The anchors are known to be white (255,255,255).  By sampling what
+   * the camera actually captured at those positions, we can correct all
+   * subsequent colour samples.
+   *
+   * Returns { r: gain_r, g: gain_g, b: gain_b } where gain ≈ 255/captured.
+   */
+  function calibrateWhiteBalance(imageData, width, anchors, sampleRadius) {
+    var sumR = 0, sumG = 0, sumB = 0;
+
+    for (var i = 0; i < anchors.length; i++) {
+      var c = samplePoint(
+        imageData, width,
+        Math.round(anchors[i].x), Math.round(anchors[i].y),
+        sampleRadius
+      );
+      sumR += c.r;
+      sumG += c.g;
+      sumB += c.b;
+    }
+
+    var avgR = sumR / anchors.length;
+    var avgG = sumG / anchors.length;
+    var avgB = sumB / anchors.length;
+
+    // Protect against division by zero / very dark anchors
+    return {
+      r: avgR > 20 ? 255 / avgR : 1,
+      g: avgG > 20 ? 255 / avgG : 1,
+      b: avgB > 20 ? 255 / avgB : 1,
+      // store raw values for debug display
+      rawR: Math.round(avgR),
+      rawG: Math.round(avgG),
+      rawB: Math.round(avgB),
+    };
+  }
+
+  /**
+   * Given a transform and layout, sample pixel colors at each dot
+   * position, apply white-balance correction, match to palette,
+   * and return an array of palette indices.
+   *
+   * Also populates result.debugRgb with raw+corrected RGB for the
+   * first 6 dots (ring 1) for diagnostic display.
+   */
+  function sampleDots(imageData, width, transform, layoutData, wbGain) {
     var center = transform.center;
     var scale = transform.scale;
     var rotation = transform.rotation;
@@ -361,57 +434,38 @@
       }
     }
 
-    var results = [];
-    // Larger sample area to capture the dot core through camera blur.
     var sampleRadius = Math.max(2, Math.floor(scale * 0.025));
-
-    // Pre-compute rotation matrix once (constant for all dots in a frame).
     var cosR = Math.cos(rotation);
     var sinR = Math.sin(rotation);
+
+    var results = [];
+    results.debugRgb = []; // first 6 dots' raw + corrected RGB
 
     for (var i = 0; i < allDots.length; i++) {
       var dot = allDots[i];
 
-      // Transform pattern coordinates to pixel coordinates.
       var rx = dot.x * cosR - dot.y * sinR;
       var ry = dot.x * sinR + dot.y * cosR;
       var px = Math.round(center.x + rx * scale);
       var py = Math.round(center.y + ry * scale);
 
-      // Sample a small area around the dot center and average.
-      // Use only pixels within the circular sample area (not a square).
-      var totalR = 0,
-        totalG = 0,
-        totalB = 0,
-        count = 0;
-      var sr2 = sampleRadius * sampleRadius;
+      var raw = samplePoint(imageData, width, px, py, sampleRadius);
 
-      for (var sy = -sampleRadius; sy <= sampleRadius; sy++) {
-        for (var sx = -sampleRadius; sx <= sampleRadius; sx++) {
-          if (sx * sx + sy * sy > sr2) continue; // circular sampling
-          var spx = px + sx;
-          var spy = py + sy;
-          if (spx >= 0 && spx < width && spy >= 0 && spy < imageData.height) {
-            var idx = (spy * width + spx) * 4;
-            totalR += data[idx];
-            totalG += data[idx + 1];
-            totalB += data[idx + 2];
-            count++;
-          }
-        }
+      // Apply white-balance correction
+      var cr = Math.min(255, Math.round(raw.r * wbGain.r));
+      var cg = Math.min(255, Math.round(raw.g * wbGain.g));
+      var cb = Math.min(255, Math.round(raw.b * wbGain.b));
+
+      // Store debug info for first 6 dots
+      if (i < 6) {
+        results.debugRgb.push({
+          raw: raw,
+          corrected: { r: cr, g: cg, b: cb },
+          matched: matchColor(cr, cg, cb),
+        });
       }
 
-      if (count > 0) {
-        results.push(
-          matchColor(
-            Math.round(totalR / count),
-            Math.round(totalG / count),
-            Math.round(totalB / count)
-          )
-        );
-      } else {
-        results.push(0);
-      }
+      results.push(matchColor(cr, cg, cb));
     }
 
     return results;
@@ -600,6 +654,8 @@
     this._dbgHeader = null;        // {frameIndex, totalFrames} from last decode
     this._dbgBlobCount = 0;
     this._dbgStatus = "waiting";   // waiting | no-blobs | no-triangle | sampling | decoded
+    this._dbgWB = null;            // white-balance gain info
+    this._dbgDotRgb = null;        // raw+corrected RGB for first 6 dots
   }
 
   /** Register a progress callback: function(progress: 0-1) */
@@ -728,8 +784,20 @@
 
     this._dbgStatus = "sampling";
 
-    // Sample dot colors and store debug positions
-    var dotValues = sampleDots(imageData, vw, transform, this._layoutData);
+    // White-balance calibration from anchor dots.
+    // The anchors are known white — comparing expected vs actual reveals
+    // the camera's per-channel colour shift.
+    var sampleR = Math.max(2, Math.floor(transform.scale * 0.025));
+    var wbGain = calibrateWhiteBalance(
+      imageData, vw, transform.anchors, sampleR
+    );
+    this._dbgWB = wbGain;
+
+    // Sample dot colors with WB correction
+    var dotValues = sampleDots(
+      imageData, vw, transform, this._layoutData, wbGain
+    );
+    this._dbgDotRgb = dotValues.debugRgb || null;
 
     // Store dot positions for debug overlay
     var allDots = [];
@@ -881,6 +949,14 @@
         "rot: " + (this._dbgTransform.rotation * 180 / Math.PI).toFixed(1) + "°"
       );
     }
+    if (this._dbgWB) {
+      debugLines.push(
+        "wb: " + this._dbgWB.rawR + "," +
+        this._dbgWB.rawG + "," + this._dbgWB.rawB +
+        " g=" + this._dbgWB.r.toFixed(2) + "/" +
+        this._dbgWB.g.toFixed(2) + "/" + this._dbgWB.b.toFixed(2)
+      );
+    }
     if (this._dbgHeader) {
       debugLines.push(
         "hdr: frame=" + this._dbgHeader.frameIndex +
@@ -888,6 +964,19 @@
       );
     }
     debugLines.push("recv: " + this._decoder._received);
+    // Show first 6 dots' raw→corrected→matched colour index
+    if (this._dbgDotRgb) {
+      for (var dri = 0; dri < this._dbgDotRgb.length; dri++) {
+        var dr = this._dbgDotRgb[dri];
+        debugLines.push(
+          "d" + dri + ": " +
+          dr.raw.r + "," + dr.raw.g + "," + dr.raw.b +
+          " → " +
+          dr.corrected.r + "," + dr.corrected.g + "," + dr.corrected.b +
+          " =" + dr.matched
+        );
+      }
+    }
 
     for (var li = 0; li < debugLines.length; li++) {
       ctx.fillText(debugLines[li], 10, 60 + li * 16);
