@@ -487,12 +487,15 @@
    */
   // Minimum captures per frame before we trust the majority-voted result.
   var MIN_VOTES = 5;
+  // Minimum captures agreeing on totalFrames before we lock it in.
+  var FT_CONSENSUS_MIN = 3;
 
   function Decoder() {
     this._votes = {};       // frameIndex -> array of dotValues arrays
     this._frames = {};      // frameIndex -> Uint8Array (majority-voted payload)
     this._totalFrames = null;
     this._received = 0;
+    this._ftCounts = {};    // totalFrames value -> count of captures with that value
   }
 
   /** Convert an array of palette indices (0-7, 3 bits each) into bytes. */
@@ -564,14 +567,24 @@
       return { complete: false, progress: this.progress() };
     }
 
-    // If totalFrames changes, reset
-    if (this._totalFrames !== null && totalFrames !== this._totalFrames) {
-      this._votes = {};
-      this._frames = {};
-      this._received = 0;
+    // ── totalFrames consensus locking ──────────────────────────────
+    // Instead of resetting on every totalFrames change (which wipes
+    // accumulated votes), we lock totalFrames once enough captures agree.
+    // Captures with a different totalFrames are silently skipped.
+    this._ftCounts[totalFrames] = (this._ftCounts[totalFrames] || 0) + 1;
+
+    if (this._totalFrames === null) {
+      // Not locked yet — need FT_CONSENSUS_MIN agreeing captures
+      if (this._ftCounts[totalFrames] < FT_CONSENSUS_MIN) {
+        return { complete: false, progress: 0 };
+      }
+      this._totalFrames = totalFrames;
     }
 
-    this._totalFrames = totalFrames;
+    // Reject captures that disagree with the locked totalFrames
+    if (totalFrames !== this._totalFrames) {
+      return { complete: false, progress: this.progress() };
+    }
 
     // Accumulate this capture as a vote for this frame
     if (!this._votes[frameIndex]) {
@@ -589,6 +602,18 @@
     if (numVotes >= MIN_VOTES) {
       var voted = this._majorityVote(this._votes[frameIndex]);
       var votedBytes = this._dotsToBytes(voted);
+
+      // Verify the majority-voted header matches expectations.
+      // If votes were mis-bucketed (captures from different frames mixed
+      // together), the voted header will disagree — discard and retry.
+      var votedFi = votedBytes[0];
+      var votedFt = votedBytes[1];
+      if (votedFi !== frameIndex || votedFt !== this._totalFrames) {
+        // Votes are misaligned — clear and re-accumulate
+        this._votes[frameIndex] = [];
+        return { complete: false, progress: this.progress() };
+      }
+
       var payload = votedBytes.slice(2);
 
       if (!this._frames[frameIndex]) {
@@ -664,6 +689,7 @@
     this._frames = {};
     this._totalFrames = null;
     this._received = 0;
+    this._ftCounts = {};
   };
 
   // ── DotbeamScanner ─────────────────────────────────────────────────
@@ -1108,6 +1134,15 @@
         " total=" + this._dbgHeader.totalFrames
       );
     }
+    // Show decoder's locked totalFrames and ft consensus votes
+    var ftLock = this._decoder._totalFrames;
+    var ftInfo = "ft: " + (ftLock !== null ? ftLock : "?");
+    var ftParts = [];
+    for (var ftk in this._decoder._ftCounts) {
+      ftParts.push(ftk + ":" + this._decoder._ftCounts[ftk]);
+    }
+    if (ftParts.length > 0) ftInfo += " (" + ftParts.join(" ") + ")";
+    debugLines.push(ftInfo);
     // Show recv count and per-frame vote tallies
     var voteInfo = "";
     if (this._decoder._totalFrames) {
